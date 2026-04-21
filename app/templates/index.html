@@ -375,7 +375,7 @@
       // we listen for 'stage' events here and render into #stages ourselves.
       const STAGE_LABELS = {
         embed: "Embedding query",
-        search: "Vector retrieval",
+        search: "Hybrid retrieval (vector + BM25)",
         rerank: "Cross-encoder rerank",
         prompt: "Building prompt",
         llm: "Claude Opus 4.7",
@@ -414,10 +414,11 @@
       function formatSearch(s) {
         if (s.status === "active") return `<span class="meta">retrieving candidates…</span>`;
         const topLine = s.top_score != null
-          ? `top cosine ${s.top_score.toFixed(3)}`
+          ? `top RRF ${s.top_score.toFixed(3)}`
           : "no hits";
         return `
           <span class="meta">${s.k_retrieved} candidates · ${s.ms} ms · ${topLine}</span>
+          <span class="meta">vector ${s.vector_hits} · BM25 ${s.keyword_hits} · overlap ${s.overlap}</span>
         `;
       }
 

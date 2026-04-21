@@ -45,10 +45,12 @@ app = FastAPI(lifespan=lifespan)
 async def run_search_pipeline(
     pool, query: str, top_k: int = SEARCH_TOP_K
 ) -> list[dict]:
-    """Retrieve candidates, then rerank. Returns top_k results with both
-    retrieval score and rerank_score populated."""
+    """Retrieve candidates via hybrid (vector + BM25 + RRF), then rerank.
+    Returns top_k results with both retrieval and rerank scores populated."""
     vector = embeddings.embed_query(query)
-    candidates = await search.search_by_vector(pool, vector, k=RETRIEVE_K)
+    candidates = await search.hybrid_search(
+        pool, query, vector, k_retrieve=RETRIEVE_K, k_final=RETRIEVE_K
+    )
     return rerank.rerank(query, candidates, top_k=top_k)
 
 
@@ -97,16 +99,28 @@ async def summary_endpoint(request: Request, query: str) -> EventSourceResponse:
             preview=[round(float(x), 3) for x in vector[:8]],
         )
 
-        # --- Stage 2: retrieval --------------------------------------------
+        # --- Stage 2: hybrid retrieval (vector + BM25 + RRF) --------------
         yield _stage("search", "active")
         t0 = time.perf_counter()
-        candidates = await search.search_by_vector(pool, vector, k=RETRIEVE_K)
+        candidates = await search.hybrid_search(
+            pool, query, vector,
+            k_retrieve=RETRIEVE_K, k_final=RETRIEVE_K,
+        )
         search_ms = int((time.perf_counter() - t0) * 1000)
+        vector_hits = sum(1 for c in candidates if c.get("vector_rank") is not None)
+        keyword_hits = sum(1 for c in candidates if c.get("keyword_rank") is not None)
+        overlap = sum(
+            1 for c in candidates
+            if c.get("vector_rank") is not None and c.get("keyword_rank") is not None
+        )
         yield _stage(
             "search",
             "done",
             ms=search_ms,
             k_retrieved=len(candidates),
+            vector_hits=vector_hits,
+            keyword_hits=keyword_hits,
+            overlap=overlap,
             top_score=round(candidates[0]["score"], 3) if candidates else None,
         )
 

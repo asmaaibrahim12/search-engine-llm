@@ -7,6 +7,10 @@ import numpy as np
 
 from app.embeddings import embed_query
 
+# -----------------------------------------------------------------------------
+# Vector-only search (fallback / testing)
+# -----------------------------------------------------------------------------
+
 VECTOR_SQL = """
 SELECT id,
        title,
@@ -21,8 +25,7 @@ LIMIT $2
 async def search_by_vector(
     pool: asyncpg.Pool, vector: Sequence[float], k: int = 10
 ) -> list[dict[str, Any]]:
-    """Run pgvector cosine-similarity search against the content_embedding
-    column (title + body concatenated)."""
+    """Pure cosine-similarity search over content_embedding."""
     arr = np.array(vector, dtype=np.float32)
     async with pool.acquire() as conn:
         rows = await conn.fetch(VECTOR_SQL, arr, k)
@@ -37,8 +40,84 @@ async def search_by_vector(
     ]
 
 
+# -----------------------------------------------------------------------------
+# Hybrid search: vector + BM25 with Reciprocal Rank Fusion
+# -----------------------------------------------------------------------------
+#
+# Each side independently returns its top N by its own score. We then fuse by
+# rank (not score) using RRF: score = 1/(k + rank). The constant k=60 is from
+# the original Cormack et al. paper and is the robust default; no tuning
+# required until you have a labeled eval set to tune against.
+#
+# The LEFT JOIN means a row qualifying in only ONE of the two halves still
+# gets included — important so that pure-keyword queries (e.g. exact product
+# names) aren't dropped just because the vector side didn't surface them, and
+# vice versa.
+
+HYBRID_SQL = """
+WITH vector_hits AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY content_embedding <=> $1) AS rnk
+    FROM outdoors
+    ORDER BY content_embedding <=> $1
+    LIMIT $2
+),
+keyword_hits AS (
+    SELECT id, ROW_NUMBER() OVER (
+        ORDER BY ts_rank_cd(content_tsv, websearch_to_tsquery('english', $3)) DESC
+    ) AS rnk
+    FROM outdoors
+    WHERE content_tsv @@ websearch_to_tsquery('english', $3)
+    LIMIT $2
+)
+SELECT o.id,
+       o.title,
+       o.body,
+       COALESCE(1.0 / (60 + v.rnk), 0) + COALESCE(1.0 / (60 + k.rnk), 0) AS score,
+       v.rnk AS vector_rank,
+       k.rnk AS keyword_rank
+FROM outdoors o
+LEFT JOIN vector_hits  v ON v.id = o.id
+LEFT JOIN keyword_hits k ON k.id = o.id
+WHERE v.rnk IS NOT NULL OR k.rnk IS NOT NULL
+ORDER BY score DESC
+LIMIT $4
+"""
+
+
+async def hybrid_search(
+    pool: asyncpg.Pool,
+    query: str,
+    vector: Sequence[float],
+    k_retrieve: int = 50,
+    k_final: int = 50,
+) -> list[dict[str, Any]]:
+    """Fuse vector + keyword retrieval via RRF.
+
+    `k_retrieve` is how many each side fetches before fusion.
+    `k_final` is how many the fused SELECT returns.
+
+    If you're feeding this into a reranker, keep k_final == k_retrieve so
+    the reranker sees the full fused pool.
+    """
+    arr = np.array(vector, dtype=np.float32)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(HYBRID_SQL, arr, k_retrieve, query, k_final)
+    return [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "body": row["body"],
+            "score": float(row["score"]),
+            "vector_rank": row["vector_rank"],
+            "keyword_rank": row["keyword_rank"],
+        }
+        for row in rows
+    ]
+
+
 async def semantic_search(
     pool: asyncpg.Pool, query: str, k: int = 10
 ) -> list[dict[str, Any]]:
-    """Convenience wrapper: embed then search."""
+    """Convenience wrapper: embed then vector-search. Used by tests and as
+    a simple fallback when hybrid isn't desired."""
     return await search_by_vector(pool, embed_query(query), k)

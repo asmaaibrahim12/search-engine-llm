@@ -13,14 +13,45 @@ CREATE TABLE IF NOT EXISTS outdoors (
     id BIGINT PRIMARY KEY,
     title TEXT NOT NULL,
     body TEXT,
-    content_embedding vector(768)
+    content_embedding vector(768),
+    content_tsv tsvector
 );
 
 -- Drop legacy title-only column from earlier schemas, if it's still around.
 ALTER TABLE outdoors DROP COLUMN IF EXISTS title_embedding;
 
+-- Backfill content_tsv for rows inserted before the column existed.
+UPDATE outdoors
+SET content_tsv = to_tsvector(
+    'english',
+    coalesce(title, '') || ' ' || coalesce(body, '')
+)
+WHERE content_tsv IS NULL;
+
+-- HNSW for vector cosine search.
 CREATE INDEX IF NOT EXISTS outdoors_content_embedding_idx
     ON outdoors USING hnsw (content_embedding vector_cosine_ops);
+
+-- GIN for BM25-style full-text search over title + body.
+CREATE INDEX IF NOT EXISTS outdoors_content_tsv_idx
+    ON outdoors USING GIN (content_tsv);
+
+-- Keep content_tsv in sync with title and body via trigger, so the indexer
+-- (and any ad-hoc INSERT/UPDATE) doesn't have to know about the tsvector.
+CREATE OR REPLACE FUNCTION outdoors_tsv_refresh() RETURNS trigger AS $$
+BEGIN
+    NEW.content_tsv := to_tsvector(
+        'english',
+        coalesce(NEW.title, '') || ' ' || coalesce(NEW.body, '')
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS outdoors_tsv_update ON outdoors;
+CREATE TRIGGER outdoors_tsv_update
+    BEFORE INSERT OR UPDATE OF title, body ON outdoors
+    FOR EACH ROW EXECUTE FUNCTION outdoors_tsv_refresh();
 """
 
 
