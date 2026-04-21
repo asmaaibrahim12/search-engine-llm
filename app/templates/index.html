@@ -375,7 +375,8 @@
       // we listen for 'stage' events here and render into #stages ourselves.
       const STAGE_LABELS = {
         embed: "Embedding query",
-        search: "Vector search",
+        search: "Vector retrieval",
+        rerank: "Cross-encoder rerank",
         prompt: "Building prompt",
         llm: "Claude Opus 4.7",
       };
@@ -411,18 +412,34 @@
       }
 
       function formatSearch(s) {
-        const top = (s.hits || [])[0];
+        if (s.status === "active") return `<span class="meta">retrieving candidates…</span>`;
+        const topLine = s.top_score != null
+          ? `top cosine ${s.top_score.toFixed(3)}`
+          : "no hits";
+        return `
+          <span class="meta">${s.k_retrieved} candidates · ${s.ms} ms · ${topLine}</span>
+        `;
+      }
+
+      function formatRerank(s) {
+        if (s.status === "active") {
+          return `<span class="meta">scoring with ${s.model}…</span>`;
+        }
         const header = `
-          <span class="meta">
-            ${s.k_retrieved} hits · ${s.ms} ms · top ${top ? top.score.toFixed(3) : "—"}
-          </span>
+          <span class="meta">${s.model}</span>
+          <span class="meta">${s.candidates_in} -> ${s.candidates_out} · ${s.ms} ms</span>
           <span class="meta">${s.k_used} sent to Claude</span>
         `;
-        const bars = (s.hits || [])
+        const hits = s.hits || [];
+        const max = hits.length ? hits[0].score : 1;
+        const bars = hits
           .map((h, i) => {
-            const width = Math.max(2, Math.round(h.score * 100));
+            // rerank scores are logits, can be negative; normalize into [0, 1]
+            // relative to top score for display width
+            const width = Math.max(2, Math.round(Math.max(0, h.score / (max || 1)) * 100));
             const cls = i < s.k_used ? "hitbar top" : "hitbar";
-            return `<span class="${cls}" style="width:${width}%" title="${h.score.toFixed(3)} — ${h.title.replace(/"/g, "&quot;")}"></span>`;
+            const safeTitle = h.title.replace(/"/g, "&quot;");
+            return `<span class="${cls}" style="width:${width}%" title="${h.score.toFixed(3)} — ${safeTitle}"></span>`;
           })
           .join("");
         return header + `<div class="hitbars">${bars}</div>`;
@@ -446,6 +463,7 @@
       const FORMATTERS = {
         embed: formatEmbed,
         search: formatSearch,
+        rerank: formatRerank,
         prompt: formatPrompt,
         llm: formatLLM,
       };

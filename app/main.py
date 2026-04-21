@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
-from app import embeddings, rag, search
+from app import embeddings, rag, rerank, search
 from app.db import create_pool, ensure_schema
 
 load_dotenv()
@@ -20,13 +20,17 @@ load_dotenv()
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-PROMPT_TOP_K = 5
-SEARCH_TOP_K = 10
+# Pipeline constants
+RETRIEVE_K = 50   # candidates fetched by the retriever (vector / hybrid)
+SEARCH_TOP_K = 10  # final results shown to the user
+PROMPT_TOP_K = 5   # top results passed into the LLM prompt
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Warm both models so the first request doesn't pay the load cost.
     embeddings.get_model()
+    rerank.get_reranker()
     app.state.pool = await create_pool()
     await ensure_schema(app.state.pool)
     try:
@@ -36,6 +40,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+async def run_search_pipeline(
+    pool, query: str, top_k: int = SEARCH_TOP_K
+) -> list[dict]:
+    """Retrieve candidates, then rerank. Returns top_k results with both
+    retrieval score and rerank_score populated."""
+    vector = embeddings.embed_query(query)
+    candidates = await search.search_by_vector(pool, vector, k=RETRIEVE_K)
+    return rerank.rerank(query, candidates, top_k=top_k)
 
 
 @app.get("/healthz", response_class=PlainTextResponse)
@@ -50,9 +64,7 @@ async def index(request: Request) -> HTMLResponse:
 
 @app.post("/search", response_class=HTMLResponse)
 async def search_endpoint(request: Request, query: str = Form(...)) -> HTMLResponse:
-    results = await search.semantic_search(
-        request.app.state.pool, query, k=SEARCH_TOP_K
-    )
+    results = await run_search_pipeline(request.app.state.pool, query)
     return templates.TemplateResponse(
         request,
         "results.html",
@@ -61,8 +73,6 @@ async def search_endpoint(request: Request, query: str = Form(...)) -> HTMLRespo
 
 
 def _stage(name: str, status: str, **extra: object) -> dict[str, str]:
-    """Build an SSE stage event. Payload is JSON-encoded so the browser can
-    parse a single 'data:' line."""
     payload: dict[str, object] = {"name": name, "status": status, **extra}
     return {"event": "stage", "data": json.dumps(payload)}
 
@@ -87,33 +97,52 @@ async def summary_endpoint(request: Request, query: str) -> EventSourceResponse:
             preview=[round(float(x), 3) for x in vector[:8]],
         )
 
-        # --- Stage 2: vector search ----------------------------------------
+        # --- Stage 2: retrieval --------------------------------------------
         yield _stage("search", "active")
         t0 = time.perf_counter()
-        results = await search.search_by_vector(pool, vector, k=SEARCH_TOP_K)
+        candidates = await search.search_by_vector(pool, vector, k=RETRIEVE_K)
         search_ms = int((time.perf_counter() - t0) * 1000)
         yield _stage(
             "search",
             "done",
             ms=search_ms,
+            k_retrieved=len(candidates),
+            top_score=round(candidates[0]["score"], 3) if candidates else None,
+        )
+
+        # --- Stage 3: rerank ----------------------------------------------
+        yield _stage("rerank", "active", model=rerank.MODEL_NAME)
+        t0 = time.perf_counter()
+        results = rerank.rerank(query, candidates, top_k=SEARCH_TOP_K)
+        rerank_ms = int((time.perf_counter() - t0) * 1000)
+        yield _stage(
+            "rerank",
+            "done",
+            ms=rerank_ms,
+            model=rerank.MODEL_NAME,
+            candidates_in=len(candidates),
+            candidates_out=len(results),
             hits=[
-                {"title": r["title"], "score": round(r["score"], 3)} for r in results
+                {
+                    "title": r["title"],
+                    "score": round(r["rerank_score"], 3),
+                }
+                for r in results
             ],
-            k_retrieved=len(results),
             k_used=PROMPT_TOP_K,
         )
 
-        # --- Stage 3: prompt build -----------------------------------------
+        # --- Stage 4: prompt build -----------------------------------------
         yield _stage("prompt", "active")
         prompt = rag.build_prompt(query, results, k=PROMPT_TOP_K)
         yield _stage(
             "prompt",
             "done",
             chars=len(prompt),
-            approx_tokens=len(prompt) // 4,  # rough heuristic; 1 token ≈ 4 chars
+            approx_tokens=len(prompt) // 4,
         )
 
-        # --- Stage 4: LLM stream -------------------------------------------
+        # --- Stage 5: LLM stream -------------------------------------------
         yield _stage("llm", "active", model=rag.MODEL)
         t0 = time.perf_counter()
         token_count = 0
