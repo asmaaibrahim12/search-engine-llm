@@ -26,6 +26,15 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
     dsn = dsn or os.environ["DATABASE_URL"]
+    # Bootstrap: make sure the `vector` extension exists BEFORE the pool's
+    # init hook calls register_vector() — otherwise that hook fails with
+    # "unknown type: public.vector" on the very first connection the pool
+    # warms up.
+    bootstrap = await asyncpg.connect(dsn)
+    try:
+        await bootstrap.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    finally:
+        await bootstrap.close()
     return await asyncpg.create_pool(dsn, min_size=1, max_size=5, init=_init_connection)
 
 
