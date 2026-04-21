@@ -1,0 +1,21 @@
+<h3>Results for <em>{{ query }}</em></h3>
+
+<div
+  class="summary"
+  hx-ext="sse"
+  sse-connect="/summary?query={{ query | urlencode }}"
+  sse-swap="token"
+  hx-swap="beforeend"
+></div>
+
+<ol class="results">
+  {% for r in results %}
+    <li>
+      <strong>{{ r.title }}</strong>
+      <span class="score">({{ '%.3f' % r.score }})</span>
+      {% if r.body %}
+        <div>{{ r.body | truncate(400) }}</div>
+      {% endif %}
+    </li>
+  {% endfor %}
+</ol>
