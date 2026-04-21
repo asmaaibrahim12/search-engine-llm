@@ -2,7 +2,13 @@
 <html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#F4F1EA" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1F1E1B" media="(prefers-color-scheme: dark)" />
     <title>Outdoors semantic search</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -46,6 +52,11 @@
 
       * { box-sizing: border-box; }
 
+      html {
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+      }
+
       html, body {
         margin: 0;
         background: var(--bg);
@@ -54,25 +65,37 @@
         font-size: 15px;
         line-height: 1.6;
         -webkit-font-smoothing: antialiased;
+        overflow-wrap: break-word;
       }
 
       .container {
         max-width: 1120px;
         margin: 0 auto;
-        padding: 56px 24px 96px;
+        /* Fluid vertical padding; horizontal uses env() for notch safety. */
+        padding:
+          clamp(24px, 5vw, 56px)
+          max(16px, env(safe-area-inset-right))
+          clamp(48px, 10vw, 96px)
+          max(16px, env(safe-area-inset-left));
       }
 
       .header {
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
-        gap: 16px;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .header > div:first-child {
+        /* Let the title take remaining space and wrap cleanly. */
+        min-width: 0;
+        flex: 1 1 280px;
       }
 
       h1 {
         font-family: Fraunces, Georgia, serif;
         font-weight: 500;
-        font-size: 40px;
+        font-size: clamp(1.75rem, 1.2rem + 2.5vw, 2.5rem);
         line-height: 1.1;
         letter-spacing: -0.01em;
         margin: 0 0 6px;
@@ -86,14 +109,14 @@
       h2 {
         font-family: Fraunces, Georgia, serif;
         font-weight: 500;
-        font-size: 20px;
+        font-size: clamp(1.05rem, 0.95rem + 0.5vw, 1.25rem);
         margin: 0 0 16px;
       }
 
       .subtitle {
         color: var(--ink-muted);
-        margin: 0 0 40px;
-        font-size: 16px;
+        margin: 0 0 clamp(24px, 4vw, 40px);
+        font-size: clamp(0.9rem, 0.85rem + 0.3vw, 1rem);
         max-width: 620px;
       }
 
@@ -105,8 +128,12 @@
         border-radius: 999px;
         padding: 6px 14px;
         font-size: 13px;
+        min-height: 32px;
         cursor: pointer;
         font-family: inherit;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        flex-shrink: 0;
       }
       .theme-toggle:hover { color: var(--ink); }
 
@@ -125,18 +152,22 @@
 
       input[type="search"] {
         flex: 1;
+        min-width: 0;              /* allow shrinking below content width */
         border: 0;
         background: transparent;
         padding: 12px 14px;
-        font-size: 16px;
+        font-size: 16px;           /* 16px prevents iOS zoom on focus */
         font-family: inherit;
         color: var(--ink);
         outline: none;
       }
       input[type="search"]::placeholder { color: var(--ink-muted); }
+      /* Hide the WebKit X clear button — we don't need it and it eats space */
+      input[type="search"]::-webkit-search-cancel-button { appearance: none; }
 
       button {
         padding: 10px 22px;
+        min-height: 44px;          /* iOS/Android recommended touch target */
         border: 0;
         border-radius: var(--radius-sm);
         background: var(--accent);
@@ -145,11 +176,14 @@
         font-size: 15px;
         font-weight: 500;
         cursor: pointer;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
         transition: background 200ms cubic-bezier(0.22, 1, 0.36, 1);
       }
       button:hover { background: #6A9552; }
+      button:active { background: #587F3D; }
 
-      /* Two-column layout */
+      /* Two-column layout — collapses to single column below 900px */
       .grid {
         display: grid;
         grid-template-columns: minmax(0, 1fr) 320px;
@@ -157,7 +191,10 @@
         margin-top: 24px;
       }
       @media (max-width: 900px) {
-        .grid { grid-template-columns: 1fr; }
+        .grid {
+          grid-template-columns: 1fr;
+          gap: 16px;
+        }
         .trace { position: static !important; }
       }
 
@@ -165,17 +202,18 @@
         background: var(--surface);
         border: 1px solid var(--border);
         border-radius: var(--radius);
-        padding: 28px;
+        padding: clamp(16px, 3vw, 28px);
       }
       .card + .card { margin-top: 16px; }
       .card.alt { background: var(--surface-alt); }
 
       /* Summary pane */
       .summary {
-        font-size: 16px;
+        font-size: clamp(0.95rem, 0.9rem + 0.3vw, 1rem);
         color: var(--ink);
         min-height: 3rem;
         white-space: pre-wrap;
+        overflow-wrap: anywhere;
       }
       .summary:empty::before {
         content: "Summary will stream here as Claude responds…";
@@ -194,16 +232,19 @@
         display: flex;
         align-items: baseline;
         gap: 10px;
+        flex-wrap: wrap;
       }
       ol.results .title {
         font-weight: 500;
-        font-size: 16px;
+        font-size: clamp(0.95rem, 0.9rem + 0.2vw, 1rem);
         color: var(--ink);
+        overflow-wrap: anywhere;
       }
       ol.results .body {
         color: var(--ink-muted);
         font-size: 14px;
         margin-top: 4px;
+        overflow-wrap: anywhere;
       }
       .chip {
         display: inline-block;
@@ -218,7 +259,7 @@
       }
 
       /* Behind-the-scenes trace panel */
-      .trace { position: sticky; top: 24px; align-self: flex-start; }
+      .trace { position: sticky; top: 24px; align-self: flex-start; min-width: 0; }
       .trace-title {
         display: flex;
         align-items: center;
@@ -258,12 +299,13 @@
       .stage[data-status="done"] .dot { background: var(--success); }
       .stage .body {
         min-width: 0;
-        flex: 1;
+        flex: 1 1 0;
       }
       .stage .label {
         font-weight: 500;
         font-size: 14px;
         color: var(--ink);
+        overflow-wrap: anywhere;
       }
       .stage .meta {
         display: block;
@@ -271,7 +313,7 @@
         font-size: 12px;
         font-family: var(--mono);
         margin-top: 3px;
-        word-break: break-word;
+        overflow-wrap: anywhere;
       }
       .stage .meta + .meta { margin-top: 2px; }
       .stage .sparkline {
@@ -280,12 +322,15 @@
         margin-top: 8px;
         height: 18px;
         align-items: center;
+        max-width: 100%;
+        overflow: hidden;
       }
       .stage .sparkline span {
         display: block;
         width: 3px;
         background: var(--accent-soft);
         border-radius: 1px;
+        flex-shrink: 0;
       }
       .stage .hitbars { margin-top: 8px; }
       .stage .hitbar {
@@ -294,6 +339,7 @@
         border-radius: 2px;
         background: var(--accent-soft);
         margin: 3px 0;
+        max-width: 100%;
       }
       .stage .hitbar.top { background: var(--accent); }
 
@@ -302,10 +348,31 @@
         50%      { opacity: 1;    transform: scale(1.4); }
       }
 
+      /* Respect the user's reduced-motion preference */
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+          scroll-behavior: auto !important;
+        }
+      }
+
       /* First-run "empty" state before any search */
       .empty-hint {
         color: var(--ink-muted);
         font-size: 14px;
+        margin-top: 8px;
+      }
+
+      /* Phone-specific tweaks — on top of the fluid clamps above */
+      @media (max-width: 520px) {
+        .card { padding: 18px 16px; }
+        .trace-title { font-size: 12px; margin-bottom: 14px; }
+        form.search { padding: 5px; }
+        button { padding: 10px 16px; }
+        ol.results li { padding: 14px 0; }
+        .stage { padding: 12px 0; }
       }
     </style>
   </head>
