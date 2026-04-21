@@ -47,13 +47,13 @@ async def test_index_outdoors_populates_table(tmp_path, monkeypatch):
     pool = await create_pool(TEST_DATABASE_URL)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, title, title_embedding FROM outdoors ORDER BY id"
+            "SELECT id, title, content_embedding FROM outdoors ORDER BY id"
         )
     await pool.close()
 
     assert [r["id"] for r in rows] == [1, 2, 3]
     for row in rows:
-        vec = list(row["title_embedding"])
+        vec = list(row["content_embedding"])
         assert len(vec) == 768
         assert math.isclose(
             math.sqrt(sum(x * x for x in vec)), 1.0, rel_tol=1e-4

@@ -21,15 +21,19 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import create_pool, ensure_schema  # noqa: E402
-from app.embeddings import embed_batch  # noqa: E402
+from app.embeddings import embed_batch_passages  # noqa: E402
+
+# Upper bound on body length we feed into the embedder. Bodies longer than
+# this tend to drag the embedding away from the core topic and waste tokens.
+BODY_TRUNCATE = 1000
 
 UPSERT_SQL = """
-INSERT INTO outdoors (id, title, body, title_embedding)
+INSERT INTO outdoors (id, title, body, content_embedding)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (id) DO UPDATE SET
     title = EXCLUDED.title,
     body = EXCLUDED.body,
-    title_embedding = EXCLUDED.title_embedding
+    content_embedding = EXCLUDED.content_embedding
 """
 
 
@@ -42,11 +46,21 @@ def load_rows(csv_path: Path) -> pd.DataFrame:
     return df[["id", "title", "body"]].reset_index(drop=True)
 
 
+def embedding_text(title: str, body: str) -> str:
+    """Build the text we actually feed the encoder.
+
+    Title is repeated once to bias the embedding toward title words (helps on
+    short-question datasets like this one), then a truncated body is
+    appended for topical coverage."""
+    body_trimmed = (body or "").strip()[:BODY_TRUNCATE]
+    return f"{title}\n\n{title}\n\n{body_trimmed}".strip()
+
+
 async def index(csv_path: Path) -> int:
     df = load_rows(csv_path)
-    titles = df["title"].tolist()
-    print(f"Encoding {len(titles)} titles...", flush=True)
-    embeddings = embed_batch(titles)
+    texts = [embedding_text(row.title, row.body) for row in df.itertuples(index=False)]
+    print(f"Encoding {len(texts)} documents (title + body)...", flush=True)
+    embeddings = embed_batch_passages(texts)
 
     pool = await create_pool()
     await ensure_schema(pool)

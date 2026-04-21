@@ -17,10 +17,10 @@ COPY requirements.txt .
 RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
     && pip install -r requirements.txt
 
-# Pre-download the SentenceTransformer model into the image so cold starts
-# don't stall on a HuggingFace fetch.
+# Pre-download the BGE retrieval encoder at build time so cold starts don't
+# stall on a HuggingFace fetch.
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('roberta-base-nli-stsb-mean-tokens')"
+    SentenceTransformer('BAAI/bge-base-en-v1.5')"
 
 COPY app ./app
 COPY scripts ./scripts

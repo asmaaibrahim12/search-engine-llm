@@ -13,11 +13,14 @@ CREATE TABLE IF NOT EXISTS outdoors (
     id BIGINT PRIMARY KEY,
     title TEXT NOT NULL,
     body TEXT,
-    title_embedding vector(768)
+    content_embedding vector(768)
 );
 
-CREATE INDEX IF NOT EXISTS outdoors_embedding_idx
-    ON outdoors USING hnsw (title_embedding vector_cosine_ops);
+-- Drop legacy title-only column from earlier schemas, if it's still around.
+ALTER TABLE outdoors DROP COLUMN IF EXISTS title_embedding;
+
+CREATE INDEX IF NOT EXISTS outdoors_content_embedding_idx
+    ON outdoors USING hnsw (content_embedding vector_cosine_ops);
 """
 
 
@@ -60,8 +63,6 @@ async def _bootstrap_extension(dsn: str, attempts: int = 6) -> None:
 
 async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
     dsn = dsn or os.environ["DATABASE_URL"]
-    # Must run before pool creation — the pool's init hook calls
-    # register_vector(), which requires the extension to already exist.
     await _bootstrap_extension(dsn)
     return await asyncpg.create_pool(dsn, min_size=1, max_size=5, init=_init_connection)
 

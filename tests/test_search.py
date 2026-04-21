@@ -32,7 +32,7 @@ async def _seed(pool, rows: list[dict]):
     ]
     async with pool.acquire() as conn:
         await conn.executemany(
-            "INSERT INTO outdoors (id, title, body, title_embedding) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO outdoors (id, title, body, content_embedding) VALUES ($1, $2, $3, $4)",
             records,
         )
 

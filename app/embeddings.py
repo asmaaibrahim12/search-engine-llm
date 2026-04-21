@@ -3,8 +3,17 @@ from __future__ import annotations
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-MODEL_NAME = "roberta-base-nli-stsb-mean-tokens"
+# BAAI/bge-base-en-v1.5 — retrieval-tuned sentence encoder, 768-dim.
+# Strictly better than the older roberta-base-nli-stsb-mean-tokens on
+# MTEB retrieval benchmarks, same output dimensionality so no schema change.
+MODEL_NAME = "BAAI/bge-base-en-v1.5"
 EMBEDDING_DIM = 768
+
+# BGE v1.5 was trained with an asymmetric query/passage setup: queries get
+# a short instruction prefix, passages do not. Omitting the prefix on
+# queries costs 2–3 nDCG points in practice.
+# See: https://huggingface.co/BAAI/bge-base-en-v1.5
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 _model: SentenceTransformer | None = None
 
@@ -24,9 +33,21 @@ def normalize(vector: np.ndarray) -> list[float]:
 
 
 def embed_query(query: str) -> list[float]:
-    return normalize(get_model().encode(query))
+    """Encode a user query for retrieval. Applies the BGE query prefix."""
+    text = QUERY_PREFIX + query
+    return normalize(get_model().encode(text))
 
 
-def embed_batch(texts: list[str]) -> list[list[float]]:
+def embed_passage(text: str) -> list[float]:
+    """Encode a single document passage. No prefix."""
+    return normalize(get_model().encode(text))
+
+
+def embed_batch_passages(texts: list[str]) -> list[list[float]]:
+    """Batch-encode document passages. No prefix."""
     raw = get_model().encode(texts, show_progress_bar=False, batch_size=32)
     return [normalize(v) for v in raw]
+
+
+# Kept for backward compatibility with callers that imported embed_batch.
+embed_batch = embed_batch_passages

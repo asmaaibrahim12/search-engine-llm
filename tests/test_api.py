@@ -25,7 +25,7 @@ async def _seed_db():
             for i, t in enumerate(titles)
         ]
         await conn.executemany(
-            "INSERT INTO outdoors (id, title, body, title_embedding) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO outdoors (id, title, body, content_embedding) VALUES ($1, $2, $3, $4)",
             records,
         )
     await pool.close()
