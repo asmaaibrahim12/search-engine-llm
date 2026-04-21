@@ -1,6 +1,4 @@
-# Outdoors semantic search (Railway-ready)
-
-A small web app version of `rag_semantic_search.ipynb`:
+# Semantic search app
 
 - Semantic search over the outdoors Q&A dataset (~5,331 titles)
 - `sentence-transformers` (`roberta-base-nli-stsb-mean-tokens`, 768-dim) for
