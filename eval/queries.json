@@ -1,0 +1,127 @@
+[
+  {
+    "query": "best hiking boots for wide feet",
+    "must_match_any": ["boot", "wide", "footwear", "hiking"],
+    "must_not_match": []
+  },
+  {
+    "query": "how do I purify water while backpacking",
+    "must_match_any": ["water", "purif", "filter", "boil", "treat"],
+    "must_not_match": []
+  },
+  {
+    "query": "what are minimalist shoes",
+    "must_match_any": ["minimal", "shoe", "footwear", "barefoot"],
+    "must_not_match": []
+  },
+  {
+    "query": "treating hypothermia in the field",
+    "must_match_any": ["hypothermia", "cold", "warm", "freezing"],
+    "must_not_match": []
+  },
+  {
+    "query": "how to set up a top rope anchor",
+    "must_match_any": ["anchor", "rope", "climb", "belay", "top rope"],
+    "must_not_match": []
+  },
+  {
+    "query": "preventing blisters on long hikes",
+    "must_match_any": ["blister", "sock", "foot", "hike"],
+    "must_not_match": []
+  },
+  {
+    "query": "choosing a sleeping bag for winter camping",
+    "must_match_any": ["sleeping bag", "bag", "winter", "cold", "camp"],
+    "must_not_match": []
+  },
+  {
+    "query": "waterproof tent recommendations",
+    "must_match_any": ["tent", "waterproof", "rain", "dry"],
+    "must_not_match": []
+  },
+  {
+    "query": "identifying edible wild plants",
+    "must_match_any": ["plant", "edible", "forage", "wild", "food"],
+    "must_not_match": []
+  },
+  {
+    "query": "how to start a fire in wet conditions",
+    "must_match_any": ["fire", "wet", "rain", "start", "tinder", "kindling"],
+    "must_not_match": []
+  },
+  {
+    "query": "bear safety when camping",
+    "must_match_any": ["bear", "safety", "camp", "predator", "wildlife"],
+    "must_not_match": []
+  },
+  {
+    "query": "reading a topographic map",
+    "must_match_any": ["map", "topo", "compass", "navigat", "contour"],
+    "must_not_match": []
+  },
+  {
+    "query": "what to pack for a multi-day hike",
+    "must_match_any": ["pack", "hike", "backpack", "gear", "multi"],
+    "must_not_match": []
+  },
+  {
+    "query": "preventing tent condensation",
+    "must_match_any": ["tent", "condens", "moist", "ventilat"],
+    "must_not_match": []
+  },
+  {
+    "query": "knot tying for outdoor use",
+    "must_match_any": ["knot", "tie", "rope", "hitch", "bowline"],
+    "must_not_match": []
+  },
+  {
+    "query": "snakebite first aid",
+    "must_match_any": ["snake", "bite", "venom", "first aid", "emergency"],
+    "must_not_match": []
+  },
+  {
+    "query": "poison ivy treatment",
+    "must_match_any": ["poison ivy", "rash", "ivy", "itch"],
+    "must_not_match": []
+  },
+  {
+    "query": "snowboard types for beginners",
+    "must_match_any": ["snowboard", "beginner", "board", "camber", "rocker"],
+    "must_not_match": []
+  },
+  {
+    "query": "how to inspect climbing rope for wear",
+    "must_match_any": ["rope", "climb", "inspect", "wear", "damage"],
+    "must_not_match": []
+  },
+  {
+    "query": "anchoring a small yacht",
+    "must_match_any": ["anchor", "yacht", "boat", "sail"],
+    "must_not_match": []
+  },
+  {
+    "query": "storing a sleeping bag long-term",
+    "must_match_any": ["sleeping bag", "bag", "store", "storage", "loft"],
+    "must_not_match": []
+  },
+  {
+    "query": "trail shoes vs hiking boots",
+    "must_match_any": ["shoe", "boot", "trail", "hik", "footwear"],
+    "must_not_match": []
+  },
+  {
+    "query": "dealing with altitude sickness",
+    "must_match_any": ["altitude", "sick", "ams", "acclimat", "elevation"],
+    "must_not_match": []
+  },
+  {
+    "query": "what kind of stove for backpacking",
+    "must_match_any": ["stove", "cook", "fuel", "canister", "backpack"],
+    "must_not_match": []
+  },
+  {
+    "query": "defending against a mountain lion",
+    "must_match_any": ["lion", "mountain lion", "cougar", "cat", "predator", "defend", "attack"],
+    "must_not_match": []
+  }
+]
