@@ -1,5 +1,6 @@
 -r requirements.txt
 pytest==8.3.4
 pytest-asyncio==0.25.0
-httpx==0.28.1
+# httpx version comes from requirements.txt (pinned <0.28 for anthropic
+# compatibility). AsyncClient's public API we use in tests is unchanged.
 asgi-lifespan==2.1.0
