@@ -41,7 +41,16 @@
     </div>
   </div>
 
-  <aside class="card alt trace">
+  {# sse-swap="stage" makes HTMX register a listener for "stage" events on
+     the shared EventSource. hx-swap="none" stops HTMX from touching the DOM
+     itself — we render the cards in the htmx:sseMessage JS handler. Without
+     this, HTMX never attaches a listener for "stage" and the events arrive
+     at the browser with nothing to consume them. #}
+  <aside
+    class="card alt trace"
+    sse-swap="stage"
+    hx-swap="none"
+  >
     <h3 class="trace-title">
       <span class="tick"></span>
       Behind the scenes
