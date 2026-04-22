@@ -58,7 +58,10 @@ async def test_stream_summary_uses_opus_4_7_and_max_tokens(fake_claude):
         break
     kwargs = fake_claude._captured
     assert kwargs["model"] == "claude-opus-4-7"
-    assert kwargs["max_tokens"] == 16000
+    # max_tokens is deliberately small to keep summaries to a few sentences,
+    # not a multi-section essay. If this goes up, the UI text will explode.
+    assert kwargs["max_tokens"] == rag.MAX_TOKENS
+    assert kwargs["max_tokens"] <= 1000
 
 
 @pytest.mark.asyncio

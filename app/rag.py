@@ -6,26 +6,23 @@ from typing import AsyncIterator, Iterable, Mapping
 import anthropic
 
 MODEL = "claude-opus-4-7"
-MAX_TOKENS = 16000
+MAX_TOKENS = 600  # ~3-5 sentences. Hard cap to prevent multi-section essays.
 
-PROMPT_TEMPLATE = """# Instructions
-For the given user query and search results, create a helpful summary of the results relevant to the query.
+PROMPT_TEMPLATE = """Answer the user's query in 2-4 sentences, grounded only in the search results below.
 
-## User Query: {query}
+Rules:
+- Cite claims inline with [1], [2], etc., matching the numbered results.
+- Plain prose only. No headings, no bullet lists, no "Overview" or "Conclusion" sections.
+- If the results don't actually answer the query, say so in one sentence.
+- Be direct. No preamble like "Based on the search results…".
 
-## Search Results:
+## Query
+{query}
+
+## Search Results
 {context}
 
-## Summary Generation :
-- Generate a comprehensive summary of the user's query topic using the provided search results.
-- Use the reference tags (e.g., [1], [2]) to cite specific information from the search results in the summary.
-- Ensure all information is cross-referenced for consistency. Avoid including contradictory statements.
-- Prioritize factual accuracy, grounding the summary in the content of the provided search results.
-- Structure the summary with an introductory overview, detailed exploration of key points, and a concluding statement.
-
-Please create a summary following these guidelines to ensure consistency and accuracy.
-
-ANSWER:"""
+## Answer"""
 
 
 def build_prompt(
