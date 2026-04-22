@@ -308,8 +308,34 @@
       ol.results li {
         padding: 16px 0;
         border-top: 1px solid var(--border);
+        cursor: pointer;
+        position: relative;
       }
       ol.results li:first-child { border-top: 0; padding-top: 0; }
+      ol.results li:hover { background: var(--surface-alt); }
+
+      /* Thumbs */
+      .thumbs {
+        margin-top: 8px;
+        display: flex;
+        gap: 4px;
+      }
+      .thumb {
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 3px 10px;
+        min-height: 28px;
+        font-size: 14px;
+        color: var(--ink-muted);
+        cursor: pointer;
+        line-height: 1;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .thumb:hover { background: var(--surface-alt); color: var(--ink); }
+      .thumb.voted-up   { background: var(--accent-soft); color: var(--accent-ink); border-color: transparent; }
+      .thumb.voted-down { background: var(--border); color: var(--ink); border-color: transparent; }
       ol.results .title-row {
         display: flex;
         align-items: baseline;

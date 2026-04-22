@@ -70,6 +70,37 @@ DROP TRIGGER IF EXISTS outdoors_tsv_update ON outdoors;
 CREATE TRIGGER outdoors_tsv_update
     BEFORE INSERT OR UPDATE OF title, body ON outdoors
     FOR EACH ROW EXECUTE FUNCTION outdoors_tsv_refresh();
+
+
+-- ---------------------------------------------------------------------------
+-- Feedback / analytics
+-- ---------------------------------------------------------------------------
+--
+-- One row per user action: search submissions, result clicks, thumbs up/down.
+-- Anonymous (session cookie, no login). Enables offline analysis of what
+-- queries do well, which results get clicked/thumbed, and how each pipeline
+-- performs in production alongside the offline eval harness.
+
+CREATE TABLE IF NOT EXISTS search_events (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    session_id TEXT NOT NULL,
+    query TEXT NOT NULL,
+    event_type TEXT NOT NULL
+        CHECK (event_type IN ('search', 'click', 'thumb_up', 'thumb_down')),
+    result_id BIGINT,          -- NULL for 'search' rows
+    result_position INT,       -- 1-indexed; NULL for 'search' rows
+    pipeline TEXT,             -- which retrieval config produced the result
+    latency_ms INT,            -- for 'search' events only
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS search_events_occurred_at_idx
+    ON search_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS search_events_session_idx
+    ON search_events (session_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS search_events_query_idx
+    ON search_events (query);
 """
 
 

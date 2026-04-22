@@ -39,7 +39,12 @@
       <h2>Top results for <em>{{ query }}</em></h2>
       <ol class="results">
         {% for r in results %}
-          <li>
+          <li
+            hx-post="/events/click"
+            hx-vals='{"query": {{ query | tojson }}, "result_id": {{ r.id }}, "position": {{ loop.index }}}'
+            hx-trigger="click[!defaultPrevented] once"
+            hx-swap="none"
+          >
             <div class="title-row">
               <span class="chip">{{ '%.3f' % r.score }}</span>
               {% if r.is_accepted %}
@@ -57,6 +62,26 @@
             {% if r.body and r.title %}
               <div class="body">{{ r.body | truncate(320) }}</div>
             {% endif %}
+            <div class="thumbs" onclick="event.preventDefault()">
+              <button
+                type="button"
+                class="thumb"
+                aria-label="Mark result as helpful"
+                hx-post="/events/thumb"
+                hx-vals='{"query": {{ query | tojson }}, "result_id": {{ r.id }}, "position": {{ loop.index }}, "vote": "up"}'
+                hx-swap="none"
+                onclick="this.classList.add('voted-up'); this.nextElementSibling.classList.remove('voted-down')"
+              >👍</button>
+              <button
+                type="button"
+                class="thumb"
+                aria-label="Mark result as not helpful"
+                hx-post="/events/thumb"
+                hx-vals='{"query": {{ query | tojson }}, "result_id": {{ r.id }}, "position": {{ loop.index }}, "vote": "down"}'
+                hx-swap="none"
+                onclick="this.classList.add('voted-down'); this.previousElementSibling.classList.remove('voted-up')"
+              >👎</button>
+            </div>
           </li>
         {% else %}
           <li>

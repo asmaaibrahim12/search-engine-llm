@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, Query, Request
+from fastapi import (
+    BackgroundTasks, FastAPI, Form, HTTPException, Query, Request, Response,
+)
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
-from app import embeddings, rag, rerank, search
+from app import embeddings, events, rag, rerank, search
 from app.db import create_pool, ensure_schema
 
 load_dotenv()
@@ -101,6 +103,8 @@ async def index(request: Request) -> HTMLResponse:
 @app.post("/search", response_class=HTMLResponse)
 async def search_endpoint(
     request: Request,
+    response: Response,
+    background: BackgroundTasks,
     query: str = Form(...),
     tags: Optional[List[str]] = Form(default=None),
     item_types: Optional[List[str]] = Form(default=None),
@@ -108,9 +112,33 @@ async def search_endpoint(
 ) -> HTMLResponse:
     tags = _clean_tags(tags)
     item_types = _clean_item_types(item_types)
+
+    # Mint or read the session cookie so click/thumb events from this
+    # rendered partial can be attributed to the same session.
+    session_id = events.get_or_create_session(request, response)
+
+    t0 = time.perf_counter()
     results = await run_search_pipeline(
         request.app.state.pool, query,
         tags=tags, item_types=item_types, accepted_only=accepted_only,
+    )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Log the search event in the background so it never blocks the user.
+    background.add_task(
+        events.log_event,
+        request.app.state.pool,
+        session_id=session_id,
+        query=query,
+        event_type="search",
+        pipeline="hybrid_rerank",
+        latency_ms=latency_ms,
+        metadata={
+            "tags": tags or [],
+            "item_types": item_types or [],
+            "accepted_only": bool(accepted_only),
+            "n_results": len(results),
+        },
     )
     # Build the SSE URL for /summary with the same filters so the streamed
     # summary is grounded in the same retrieval the user sees.
@@ -254,6 +282,66 @@ async def summary_endpoint(
         yield {"event": "done", "data": ""}
 
     return EventSourceResponse(event_stream())
+
+
+# -----------------------------------------------------------------------------
+# Feedback endpoints — anonymous, session-cookie only
+# -----------------------------------------------------------------------------
+
+
+def _assert_rate_limit(session_id: str) -> None:
+    if not events.rate_limit_ok(session_id):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many events from this session; try again in a minute.",
+        )
+
+
+@app.post("/events/click", response_class=PlainTextResponse)
+async def log_click(
+    request: Request,
+    response: Response,
+    background: BackgroundTasks,
+    query: str = Form(...),
+    result_id: int = Form(...),
+    position: int = Form(...),
+) -> str:
+    session_id = events.get_or_create_session(request, response)
+    _assert_rate_limit(session_id)
+    background.add_task(
+        events.log_event,
+        request.app.state.pool,
+        session_id=session_id, query=query,
+        event_type="click",
+        result_id=result_id, result_position=position,
+        pipeline="hybrid_rerank",
+    )
+    return ""
+
+
+@app.post("/events/thumb", response_class=PlainTextResponse)
+async def log_thumb(
+    request: Request,
+    response: Response,
+    background: BackgroundTasks,
+    query: str = Form(...),
+    result_id: int = Form(...),
+    position: int = Form(...),
+    vote: str = Form(...),
+) -> str:
+    if vote not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="vote must be 'up' or 'down'")
+    session_id = events.get_or_create_session(request, response)
+    _assert_rate_limit(session_id)
+    background.add_task(
+        events.log_event,
+        request.app.state.pool,
+        session_id=session_id, query=query,
+        event_type=f"thumb_{vote}",
+        result_id=result_id, result_position=position,
+        pipeline="hybrid_rerank",
+    )
+    return ""
 
 
 if __name__ == "__main__":
