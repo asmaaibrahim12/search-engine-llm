@@ -24,6 +24,13 @@ ALTER TABLE outdoors DROP COLUMN IF EXISTS title_embedding;
 -- the column from an earlier schema.
 ALTER TABLE outdoors ALTER COLUMN title DROP NOT NULL;
 
+-- Existing databases created under a pre-hybrid schema lack content_tsv
+-- and/or content_embedding. CREATE TABLE IF NOT EXISTS is a no-op when
+-- the table exists, so we ADD COLUMN explicitly here before any UPDATE
+-- or index that references them.
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS content_embedding vector(768);
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS content_tsv tsvector;
+
 -- New metadata columns (added idempotently so re-deploying is safe).
 ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS parent_id BIGINT;
 ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS item_type TEXT
