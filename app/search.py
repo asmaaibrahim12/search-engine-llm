@@ -71,6 +71,14 @@ async def search_by_vector(
 #   +0.005  if is_accepted          (about 1/4 of a full rank, deliberate
 #                                    bump without dominating retrieval)
 #   +0.002 * log1p(upvotes)         (caps out around +0.01 at 150 upvotes)
+#   +0.003 * log1p(clicks)          (feedback-loop signal from search_events
+#                                    via the result_ctr materialized view;
+#                                    log-shrunk so long-tail noise stays small
+#                                    and a popular result gets a few hundredths)
+#   +0.003 * (log1p(thumbs_up) - log1p(thumbs_down))
+#                                   (net thumb signal, same log shrinkage —
+#                                    bounded by the size of both counts and
+#                                    symmetric around zero)
 HYBRID_SQL = """
 WITH vector_hits AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY content_embedding <=> $1) AS rnk
@@ -99,12 +107,18 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
+         + 0.003 * ln(1 + COALESCE(f.clicks, 0))
+         + 0.003 * (
+               ln(1 + COALESCE(f.thumbs_up, 0))
+             - ln(1 + COALESCE(f.thumbs_down, 0))
+           )
        ) AS score,
        v.rnk AS vector_rank,
        k.rnk AS keyword_rank
 FROM outdoors o
 LEFT JOIN vector_hits  v ON v.id = o.id
 LEFT JOIN keyword_hits k ON k.id = o.id
+LEFT JOIN result_ctr   f ON f.result_id = o.id
 WHERE v.rnk IS NOT NULL OR k.rnk IS NOT NULL
 ORDER BY score DESC
 LIMIT $4
@@ -149,12 +163,18 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
+         + 0.003 * ln(1 + COALESCE(f.clicks, 0))
+         + 0.003 * (
+               ln(1 + COALESCE(f.thumbs_up, 0))
+             - ln(1 + COALESCE(f.thumbs_down, 0))
+           )
        ) AS score,
        v.rnk AS vector_rank,
        k.rnk AS keyword_rank
 FROM outdoors o
 LEFT JOIN vector_hits  v ON v.id = o.id
 LEFT JOIN keyword_hits k ON k.id = o.id
+LEFT JOIN result_ctr   f ON f.result_id = o.id
 WHERE v.rnk IS NOT NULL OR k.rnk IS NOT NULL
 ORDER BY score DESC
 LIMIT $4

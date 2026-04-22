@@ -378,3 +378,104 @@ async def test_top_tags_empty_db(pool):
         await conn.execute("TRUNCATE outdoors")
     tags = await search.top_tags(pool)
     assert tags == []
+
+
+# -----------------------------------------------------------------------------
+# result_ctr feedback-loop bump
+# -----------------------------------------------------------------------------
+
+
+async def _insert_event(pool, *, result_id: int, event_type: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO search_events (session_id, query, event_type, result_id) "
+            "VALUES ('t', 'q', $1, $2)",
+            event_type, result_id,
+        )
+
+
+async def _refresh_ctr(pool) -> None:
+    from app.db import refresh_result_ctr
+    await refresh_result_ctr(pool)
+
+
+async def test_hybrid_search_click_bump_breaks_ties(pool):
+    """Two near-identical answers; one has prior clicks. Clicked one wins."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 1, "title": "How to lace hiking boots"},
+    ])
+    bodies = ["Use a surgeon's knot at the ankle hooks.",
+              "Use a surgeon's knot at the ankle hooks."]
+    vecs = embed_batch(bodies)
+    records = [
+        (10, 1, "answer", None, bodies[0], 5, False, [], np.array(vecs[0], dtype=np.float32)),
+        (11, 1, "answer", None, bodies[1], 5, False, [], np.array(vecs[1], dtype=np.float32)),
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO outdoors (id, parent_id, item_type, title, body, "
+            "score, is_accepted, tags, content_embedding) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            records,
+        )
+    # Log a handful of clicks on id=11; none on id=10.
+    for _ in range(5):
+        await _insert_event(pool, result_id=11, event_type="click")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("lace hiking boots")
+    results = await search.hybrid_search(
+        pool, "lace hiking boots", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[11] < positions[10], (
+        f"clicked answer should rank above unclicked on ties, got {results}"
+    )
+
+
+async def test_hybrid_search_thumb_down_demotes(pool):
+    """Two near-identical rows; one gets thumbs_down. The clean one wins."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 20, "title": "best rain jacket for spring hikes"},
+        {"id": 21, "title": "best rain jacket for spring hikes"},
+    ])
+    for _ in range(4):
+        await _insert_event(pool, result_id=20, event_type="thumb_down")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("rain jacket spring")
+    results = await search.hybrid_search(
+        pool, "rain jacket spring", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[21] < positions[20], (
+        f"thumb_down'd row should rank below the clean one, got {results}"
+    )
+
+
+async def test_hybrid_search_empty_ctr_is_noop(pool):
+    """With no events logged, ranking should match the pre-feedback behavior:
+    RRF score bounded by 2/61 when a doc is rank 1 in both halves."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 1, "title": "water purification tablets"}])
+    await _refresh_ctr(pool)
+    vec = embed_query("water purification")
+    results = await search.hybrid_search(
+        pool, "water purification", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    assert 0 < results[0]["score"] <= 2 / 61 + 1e-9

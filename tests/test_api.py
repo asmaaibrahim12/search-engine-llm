@@ -89,3 +89,31 @@ async def test_prompt_injection_still_runs_search(app_client, fake_claude):
     )
     assert r.status_code == 200
     assert "<li" in r.text
+
+
+async def test_search_logs_result_ids_in_metadata(app_client):
+    """The background `search` event must include the impression set so
+    downstream CTR analysis can join clicks back to what the user saw."""
+    import json as _json
+
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+
+        r = await app_client.post("/search", data={"query": "minimalist shoes"})
+        assert r.status_code == 200
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT metadata FROM search_events "
+                "WHERE event_type = 'search' ORDER BY occurred_at DESC LIMIT 1"
+            )
+        assert row is not None
+        meta = _json.loads(row["metadata"])
+        assert "result_ids" in meta
+        assert isinstance(meta["result_ids"], list)
+        assert len(meta["result_ids"]) == meta["n_results"]
+        assert all(isinstance(i, int) for i in meta["result_ids"])
+    finally:
+        await pool.close()

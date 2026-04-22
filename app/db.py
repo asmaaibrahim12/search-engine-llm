@@ -108,6 +108,36 @@ CREATE INDEX IF NOT EXISTS search_events_session_idx
     ON search_events (session_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS search_events_query_idx
     ON search_events (query);
+
+
+-- ---------------------------------------------------------------------------
+-- result_ctr: per-result engagement aggregate used as a tiny ranking signal
+-- ---------------------------------------------------------------------------
+--
+-- Populated from search_events. The hybrid retriever LEFT JOINs this view
+-- and adds a log-shrunk bump based on clicks + net thumbs, letting the
+-- pipeline close the feedback loop without touching the hot path.
+--
+-- It's a MATERIALIZED VIEW (not a regular view) so the retrieval query
+-- doesn't have to aggregate over search_events on every call. Refresh on
+-- a schedule — see refresh_result_ctr() — not inline on write. Starts
+-- empty; the LEFT JOIN + COALESCE means zero rows is a no-op, not an
+-- error.
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS result_ctr AS
+SELECT
+    result_id,
+    COUNT(*) FILTER (WHERE event_type = 'click')      AS clicks,
+    COUNT(*) FILTER (WHERE event_type = 'thumb_up')   AS thumbs_up,
+    COUNT(*) FILTER (WHERE event_type = 'thumb_down') AS thumbs_down
+FROM search_events
+WHERE result_id IS NOT NULL
+  AND event_type IN ('click', 'thumb_up', 'thumb_down')
+GROUP BY result_id;
+
+-- Unique index is required for REFRESH ... CONCURRENTLY.
+CREATE UNIQUE INDEX IF NOT EXISTS result_ctr_result_id_idx
+    ON result_ctr (result_id);
 """
 
 
@@ -157,3 +187,26 @@ async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+
+
+async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
+    """Recompute the result_ctr materialized view from search_events.
+
+    Call this on a schedule (e.g. hourly from a cron / Railway job).
+    CONCURRENTLY avoids blocking readers; it's safe because the unique
+    index on result_id lets Postgres diff old vs. new rows.
+
+    Best-effort: swallows errors so a refresh failure never crashes the
+    app. Falls back to a non-concurrent refresh on first call (when the
+    MV has never been populated, CONCURRENTLY raises).
+    """
+    try:
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    "REFRESH MATERIALIZED VIEW CONCURRENTLY result_ctr"
+                )
+            except asyncpg.PostgresError:
+                await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+    except Exception as exc:
+        print(f"refresh_result_ctr failed: {exc!r}", flush=True)

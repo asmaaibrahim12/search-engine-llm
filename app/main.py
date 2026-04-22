@@ -142,6 +142,10 @@ async def search_endpoint(
             "item_types": item_types or [],
             "accepted_only": bool(accepted_only),
             "n_results": len(results),
+            # Impression set: needed so click/thumb events can be
+            # joined back to what the user actually saw, and so CTR
+            # can be computed offline (or feed result_ctr MV).
+            "result_ids": [r["id"] for r in results],
         },
     )
     # Build the SSE URL for /summary with the same filters so the streamed
