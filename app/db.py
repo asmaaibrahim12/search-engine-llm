@@ -41,13 +41,13 @@ ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS is_accepted BOOLEAN
     NOT NULL DEFAULT FALSE;
 ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}';
 
--- Backfill content_tsv for rows inserted before the column existed.
-UPDATE outdoors
-SET content_tsv = to_tsvector(
-    'english',
-    coalesce(title, '') || ' ' || coalesce(body, '')
-)
-WHERE content_tsv IS NULL;
+-- NOTE: intentionally no big backfill UPDATE here. Historically we ran
+--   UPDATE outdoors SET content_tsv = to_tsvector(...) WHERE content_tsv IS NULL
+-- but on Postgres containers with the default 64 MB /dev/shm (Railway's
+-- pgvector template) that statement exceeds the shared-memory segment
+-- and crashes startup with DiskFullError. Existing rows just keep NULL
+-- content_tsv until re-indexed — the indexer's upsert trips the
+-- outdoors_tsv_update trigger and populates the column per row.
 
 -- HNSW for vector cosine search.
 CREATE INDEX IF NOT EXISTS outdoors_content_embedding_idx
