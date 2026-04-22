@@ -5,9 +5,10 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
@@ -16,6 +17,24 @@ from app import embeddings, rag, rerank, search
 from app.db import create_pool, ensure_schema
 
 load_dotenv()
+
+
+VALID_ITEM_TYPES = {"question", "answer"}
+
+
+def _clean_tags(tags: Optional[List[str]]) -> Optional[list[str]]:
+    """Filter form input: drop blanks, keep at most 10, lowercase."""
+    if not tags:
+        return None
+    cleaned = [t.strip().lower() for t in tags if t and t.strip()]
+    return cleaned[:10] or None
+
+
+def _clean_item_types(types: Optional[List[str]]) -> Optional[list[str]]:
+    if not types:
+        return None
+    cleaned = [t for t in types if t in VALID_ITEM_TYPES]
+    return cleaned or None
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -33,6 +52,12 @@ async def lifespan(app: FastAPI):
     rerank.get_reranker()
     app.state.pool = await create_pool()
     await ensure_schema(app.state.pool)
+    # Precompute the filter picker list so /search doesn't hit the DB for
+    # it on every request. Tag distribution only changes at re-index time.
+    try:
+        app.state.top_tags = await search.top_tags(app.state.pool, limit=30)
+    except Exception:
+        app.state.top_tags = []
     try:
         yield
     finally:
@@ -43,13 +68,19 @@ app = FastAPI(lifespan=lifespan)
 
 
 async def run_search_pipeline(
-    pool, query: str, top_k: int = SEARCH_TOP_K
+    pool, query: str, top_k: int = SEARCH_TOP_K,
+    tags: list[str] | None = None,
+    item_types: list[str] | None = None,
+    accepted_only: bool = False,
+    min_score: int | None = None,
 ) -> list[dict]:
-    """Retrieve candidates via hybrid (vector + BM25 + RRF), then rerank.
-    Returns top_k results with both retrieval and rerank scores populated."""
+    """Embed, retrieve (hybrid + optional filters), rerank. Returns top_k."""
     vector = embeddings.embed_query(query)
     candidates = await search.hybrid_search(
-        pool, query, vector, k_retrieve=RETRIEVE_K, k_final=RETRIEVE_K
+        pool, query, vector,
+        k_retrieve=RETRIEVE_K, k_final=RETRIEVE_K,
+        tags=tags, item_types=item_types,
+        accepted_only=accepted_only, min_score=min_score,
     )
     return rerank.rerank(query, candidates, top_k=top_k)
 
@@ -61,16 +92,45 @@ async def healthz() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "index.html", {})
+    return templates.TemplateResponse(
+        request, "index.html",
+        {"top_tags": getattr(request.app.state, "top_tags", [])},
+    )
 
 
 @app.post("/search", response_class=HTMLResponse)
-async def search_endpoint(request: Request, query: str = Form(...)) -> HTMLResponse:
-    results = await run_search_pipeline(request.app.state.pool, query)
+async def search_endpoint(
+    request: Request,
+    query: str = Form(...),
+    tags: Optional[List[str]] = Form(default=None),
+    item_types: Optional[List[str]] = Form(default=None),
+    accepted_only: bool = Form(default=False),
+) -> HTMLResponse:
+    tags = _clean_tags(tags)
+    item_types = _clean_item_types(item_types)
+    results = await run_search_pipeline(
+        request.app.state.pool, query,
+        tags=tags, item_types=item_types, accepted_only=accepted_only,
+    )
+    # Build the SSE URL for /summary with the same filters so the streamed
+    # summary is grounded in the same retrieval the user sees.
+    summary_qs = {"query": query}
+    if tags:         summary_qs["tag"] = tags
+    if item_types:   summary_qs["item_type"] = item_types
+    if accepted_only: summary_qs["accepted_only"] = "1"
     return templates.TemplateResponse(
         request,
         "results.html",
-        {"query": query, "results": results},
+        {
+            "query": query,
+            "results": results,
+            "applied_filters": {
+                "tags": tags or [],
+                "item_types": item_types or [],
+                "accepted_only": accepted_only,
+            },
+            "summary_qs": summary_qs,
+        },
     )
 
 
@@ -80,8 +140,16 @@ def _stage(name: str, status: str, **extra: object) -> dict[str, str]:
 
 
 @app.get("/summary")
-async def summary_endpoint(request: Request, query: str) -> EventSourceResponse:
+async def summary_endpoint(
+    request: Request,
+    query: str,
+    tag: Optional[List[str]] = Query(default=None),
+    item_type: Optional[List[str]] = Query(default=None),
+    accepted_only: bool = Query(default=False),
+) -> EventSourceResponse:
     pool = request.app.state.pool
+    tags = _clean_tags(tag)
+    item_types = _clean_item_types(item_type)
 
     async def event_stream():
         t_start = time.perf_counter()
@@ -100,11 +168,15 @@ async def summary_endpoint(request: Request, query: str) -> EventSourceResponse:
         )
 
         # --- Stage 2: hybrid retrieval (vector + BM25 + RRF) --------------
-        yield _stage("search", "active")
+        yield _stage("search", "active",
+                     tags=tags or [], item_types=item_types or [],
+                     accepted_only=accepted_only)
         t0 = time.perf_counter()
         candidates = await search.hybrid_search(
             pool, query, vector,
             k_retrieve=RETRIEVE_K, k_final=RETRIEVE_K,
+            tags=tags, item_types=item_types,
+            accepted_only=accepted_only,
         )
         search_ms = int((time.perf_counter() - t0) * 1000)
         vector_hits = sum(1 for c in candidates if c.get("vector_rank") is not None)

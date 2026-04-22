@@ -138,17 +138,99 @@
       .theme-toggle:hover { color: var(--ink); }
 
       /* Search form */
-      form.search {
+      .search-form { margin-bottom: 24px; }
+      .search {
         display: flex;
         gap: 6px;
-        margin-bottom: 24px;
         background: var(--surface);
         border: 1px solid var(--border);
         border-radius: var(--radius);
         padding: 6px;
         transition: border-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
       }
-      form.search:focus-within { border-color: var(--accent); }
+      .search:focus-within { border-color: var(--accent); }
+
+      /* Filters */
+      .filters {
+        margin-top: 10px;
+        padding: 0 4px;
+      }
+      .filters > summary {
+        cursor: pointer;
+        color: var(--ink-muted);
+        font-size: 13px;
+        padding: 6px 4px;
+        list-style: none;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .filters > summary::-webkit-details-marker { display: none; }
+      .filters > summary::before {
+        content: "▸ ";
+        display: inline-block;
+        transition: transform 150ms;
+        margin-right: 2px;
+      }
+      .filters[open] > summary::before { transform: rotate(90deg); }
+      .filters[open] > summary { color: var(--ink); }
+      .filter-group {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 4px;
+      }
+      .filter-label {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--ink-muted);
+        margin-right: 4px;
+      }
+      .toggle, .tag-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        font-size: 13px;
+        cursor: pointer;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .toggle input, .tag-pill input {
+        /* Hide native control; the pill's visual state tells the story. */
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+      }
+      .toggle:has(input:checked),
+      .tag-pill:has(input:checked) {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        border-color: transparent;
+      }
+
+      /* Applied-filter chips shown above the results */
+      .applied-filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 0 0 16px 0;
+      }
+      .applied-filter {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        font-size: 12px;
+        font-weight: 500;
+      }
 
       input[type="search"] {
         flex: 1;
@@ -430,19 +512,44 @@
       </div>
 
       <form
-        class="search"
+        class="search-form"
         hx-post="/search"
         hx-target="#results"
         hx-swap="innerHTML"
       >
-        <input
-          type="search"
-          name="query"
-          placeholder="Ask anything about the outdoors…"
-          required
-          autofocus
-        />
-        <button type="submit">Search</button>
+        <div class="search">
+          <input
+            type="search"
+            name="query"
+            placeholder="Ask anything about the outdoors…"
+            required
+            autofocus
+          />
+          <button type="submit">Search</button>
+        </div>
+
+        <details class="filters" {% if request.query_params.get('filters_open') %}open{% endif %}>
+          <summary>Filters</summary>
+
+          <div class="filter-group">
+            <span class="filter-label">Show</span>
+            <label class="toggle"><input type="checkbox" name="item_types" value="question" checked> Questions</label>
+            <label class="toggle"><input type="checkbox" name="item_types" value="answer" checked> Answers</label>
+            <label class="toggle"><input type="checkbox" name="accepted_only" value="1"> Only accepted answers</label>
+          </div>
+
+          {% if top_tags %}
+          <div class="filter-group">
+            <span class="filter-label">Tags</span>
+            {% for t in top_tags %}
+              <label class="tag-pill">
+                <input type="checkbox" name="tags" value="{{ t }}">
+                <span>{{ t }}</span>
+              </label>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </details>
       </form>
 
       <div id="results">

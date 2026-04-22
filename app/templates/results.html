@@ -1,12 +1,31 @@
-{# One SSE connection shared by both panels: the summary consumes `token`
-   events via HTMX sse-swap; the trace panel consumes `stage` events via JS
-   listening for htmx:sseMessage. #}
+{# Shared SSE connection: summary consumes `token` events, trace consumes
+   `stage` events. `/summary` is called with the same filters the user
+   applied so the streamed summary is grounded in the same retrieval. #}
+{% set qs %}query={{ query | urlencode }}
+  {%- for t in applied_filters.tags %}&tag={{ t | urlencode }}{% endfor %}
+  {%- for it in applied_filters.item_types %}&item_type={{ it | urlencode }}{% endfor %}
+  {%- if applied_filters.accepted_only %}&accepted_only=1{% endif %}
+{% endset %}
 <div
   hx-ext="sse"
-  sse-connect="/summary?query={{ query | urlencode }}"
+  sse-connect="/summary?{{ qs | trim }}"
   class="grid"
 >
   <div>
+    {% if applied_filters.tags or applied_filters.item_types or applied_filters.accepted_only %}
+      <div class="applied-filters">
+        {% for it in applied_filters.item_types %}
+          <span class="applied-filter">type: {{ it }}</span>
+        {% endfor %}
+        {% for t in applied_filters.tags %}
+          <span class="applied-filter">#{{ t }}</span>
+        {% endfor %}
+        {% if applied_filters.accepted_only %}
+          <span class="applied-filter">✓ accepted only</span>
+        {% endif %}
+      </div>
+    {% endif %}
+
     <div class="card">
       <h2>Summary</h2>
       <div
@@ -42,8 +61,12 @@
         {% else %}
           <li>
             <div class="body">
-              No matches. Did you seed the database
-              (<code>scripts/index_outdoors.py</code>)?
+              No matches.
+              {% if applied_filters.tags or applied_filters.accepted_only %}
+                Try loosening the filters.
+              {% else %}
+                Did you seed the database (<code>scripts/index_outdoors.py</code>)?
+              {% endif %}
             </div>
           </li>
         {% endfor %}
@@ -51,11 +74,9 @@
     </div>
   </div>
 
-  {# sse-swap="stage" makes HTMX register a listener for "stage" events on
-     the shared EventSource. hx-swap="none" stops HTMX from touching the DOM
-     itself — we render the cards in the htmx:sseMessage JS handler. Without
-     this, HTMX never attaches a listener for "stage" and the events arrive
-     at the browser with nothing to consume them. #}
+  {# sse-swap="stage" registers the listener; hx-swap="none" means HTMX
+     doesn't touch the DOM. The JS handler in index.html renders into
+     #stages itself. #}
   <aside
     class="card alt trace"
     sse-swap="stage"

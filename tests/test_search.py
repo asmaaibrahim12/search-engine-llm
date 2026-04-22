@@ -200,3 +200,181 @@ async def test_hybrid_search_includes_rank_fields(pool):
     results = await search.hybrid_search(pool, "tent stakes", vec, k_retrieve=10, k_final=10)
     assert "vector_rank" in results[0]
     assert "keyword_rank" in results[0]
+
+
+# -----------------------------------------------------------------------------
+# Filter parameters
+# -----------------------------------------------------------------------------
+
+
+async def _seed_with_metadata(pool, rows: list[dict]):
+    """Insert rows including item_type, is_accepted, tags, score."""
+    from app.embeddings import embed_batch
+
+    texts = [f"{r.get('title') or ''} {r.get('body') or ''}" for r in rows]
+    vecs = embed_batch(texts)
+    records = []
+    for i, r in enumerate(rows):
+        records.append((
+            r["id"],
+            r.get("parent_id"),
+            r.get("item_type", "question"),
+            r.get("title"),
+            r.get("body", ""),
+            r.get("score", 0),
+            r.get("is_accepted", False),
+            r.get("tags", []),
+            np.array(vecs[i], dtype=np.float32),
+        ))
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.executemany(
+            "INSERT INTO outdoors (id, parent_id, item_type, title, body, "
+            "score, is_accepted, tags, content_embedding) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            records,
+        )
+
+
+async def test_hybrid_search_filter_by_tag(pool):
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": "waterproof tent", "tags": ["camping", "tent"]},
+        {"id": 2, "title": "waterproof jacket", "tags": ["apparel", "rain"]},
+        {"id": 3, "title": "waterproof backpack", "tags": ["gear"]},
+    ])
+    vec = embed_query("waterproof gear")
+    results = await search.hybrid_search(
+        pool, "waterproof gear", vec,
+        k_retrieve=10, k_final=10,
+        tags=["camping"],
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == 1
+
+
+async def test_hybrid_search_filter_by_item_type(pool):
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": "How to pitch tent", "item_type": "question"},
+        {"id": 2, "title": None, "body": "use the rainfly first", "item_type": "answer", "parent_id": 1},
+        {"id": 3, "title": None, "body": "stake corners tightly", "item_type": "answer", "parent_id": 1},
+    ])
+    vec = embed_query("pitch tent technique")
+
+    qs_only = await search.hybrid_search(
+        pool, "pitch tent technique", vec,
+        k_retrieve=10, k_final=10, item_types=["question"],
+    )
+    assert len(qs_only) == 1
+    assert all(r["item_type"] == "question" for r in qs_only)
+
+    as_only = await search.hybrid_search(
+        pool, "pitch tent technique", vec,
+        k_retrieve=10, k_final=10, item_types=["answer"],
+    )
+    assert len(as_only) == 2
+    assert all(r["item_type"] == "answer" for r in as_only)
+
+
+async def test_hybrid_search_accepted_only(pool):
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": None, "body": "answer one", "item_type": "answer",
+         "is_accepted": True},
+        {"id": 2, "title": None, "body": "answer two", "item_type": "answer",
+         "is_accepted": False},
+    ])
+    vec = embed_query("answer")
+    results = await search.hybrid_search(
+        pool, "answer", vec, k_retrieve=10, k_final=10, accepted_only=True,
+    )
+    assert len(results) == 1
+    assert results[0]["is_accepted"] is True
+
+
+async def test_hybrid_search_min_score(pool):
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": "popular question", "score": 50},
+        {"id": 2, "title": "unpopular question", "score": 1},
+    ])
+    vec = embed_query("question")
+    results = await search.hybrid_search(
+        pool, "question", vec, k_retrieve=10, k_final=10, min_score=10,
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == 1
+
+
+async def test_hybrid_search_combined_filters(pool):
+    """Tag AND item_type AND accepted_only AND min_score all apply together."""
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        # Matches all filters
+        {"id": 1, "title": None, "body": "pitch answer", "item_type": "answer",
+         "is_accepted": True, "tags": ["camping"], "score": 20},
+        # Wrong tag
+        {"id": 2, "title": None, "body": "pitch answer", "item_type": "answer",
+         "is_accepted": True, "tags": ["climbing"], "score": 20},
+        # Not accepted
+        {"id": 3, "title": None, "body": "pitch answer", "item_type": "answer",
+         "is_accepted": False, "tags": ["camping"], "score": 20},
+        # Too low score
+        {"id": 4, "title": None, "body": "pitch answer", "item_type": "answer",
+         "is_accepted": True, "tags": ["camping"], "score": 2},
+    ])
+    vec = embed_query("pitch")
+    results = await search.hybrid_search(
+        pool, "pitch", vec, k_retrieve=10, k_final=10,
+        tags=["camping"], item_types=["answer"],
+        accepted_only=True, min_score=10,
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == 1
+
+
+async def test_hybrid_search_filters_default_noop(pool):
+    """Passing None/defaults should behave like no filters at all."""
+    from app.embeddings import embed_query
+
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": "a"}, {"id": 2, "title": "b"}, {"id": 3, "title": "c"},
+    ])
+    vec = embed_query("anything")
+    results = await search.hybrid_search(
+        pool, "anything", vec, k_retrieve=10, k_final=10,
+        tags=None, item_types=None, accepted_only=False, min_score=None,
+    )
+    assert len(results) == 3
+
+
+# -----------------------------------------------------------------------------
+# top_tags helper
+# -----------------------------------------------------------------------------
+
+
+async def test_top_tags_returns_most_common(pool):
+    await _seed_with_metadata(pool, [
+        {"id": 1, "title": "a", "tags": ["hiking", "boots"]},
+        {"id": 2, "title": "b", "tags": ["hiking", "tents"]},
+        {"id": 3, "title": "c", "tags": ["hiking"]},
+        {"id": 4, "title": "d", "tags": ["boots"]},
+        {"id": 5, "title": "e", "tags": ["rare"]},
+    ])
+    tags = await search.top_tags(pool, limit=3)
+    assert tags[0] == "hiking"  # 3 occurrences
+    assert tags[1] == "boots"   # 2
+    assert len(tags) == 3
+
+
+async def test_top_tags_empty_db(pool):
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+    tags = await search.top_tags(pool)
+    assert tags == []
