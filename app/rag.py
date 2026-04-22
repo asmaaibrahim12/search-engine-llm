@@ -13,6 +13,7 @@ PROMPT_TEMPLATE = """Answer the user's query in 2-4 sentences, grounded only in 
 Rules:
 - Cite claims inline with [1], [2], etc., matching the numbered results.
 - Plain prose only. No headings, no bullet lists, no "Overview" or "Conclusion" sections.
+- Prefer results marked "accepted answer" or "answer" over those marked "question".
 - If the results don't actually answer the query, say so in one sentence.
 - Be direct. No preamble like "Based on the search results…".
 
@@ -25,15 +26,40 @@ Rules:
 ## Answer"""
 
 
+def _citation_header(idx: int, r: Mapping[str, object]) -> str:
+    """Build the '[1 — accepted answer]' style marker for each reference.
+
+    The header tells Claude the citation's provenance: question (someone
+    asked this), answer (someone replied), or accepted answer (the
+    community confirmed it solved the question). Claude's prompt says to
+    prefer accepted answers when summarizing; this is how it can tell."""
+    kind = r.get("item_type") or "item"
+    if r.get("is_accepted"):
+        label = "accepted answer"
+    elif kind == "answer":
+        label = "answer"
+    else:
+        label = "question"
+    return f"[{idx} — {label}]"
+
+
 def build_prompt(
     query: str,
     results: Iterable[Mapping[str, object]],
     k: int = 5,
 ) -> str:
     top = list(results)[:k]
-    context = "\n".join(
-        f'[{i + 1}] {r["title"]}: {r.get("body") or ""}\n' for i, r in enumerate(top)
-    )
+    parts = []
+    for i, r in enumerate(top):
+        header = _citation_header(i + 1, r)
+        title = r.get("title") or ""
+        body = r.get("body") or ""
+        # Answers have no title; present the body with the header only.
+        if title:
+            parts.append(f"{header} {title}: {body}\n")
+        else:
+            parts.append(f"{header} {body}\n")
+    context = "\n".join(parts)
     return PROMPT_TEMPLATE.format(query=query, context=context).strip()
 
 

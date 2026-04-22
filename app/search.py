@@ -15,11 +15,30 @@ VECTOR_SQL = """
 SELECT id,
        title,
        body,
+       item_type,
+       is_accepted,
+       parent_id,
+       tags,
+       score AS upvotes,
        1 - (content_embedding <=> $1) AS score
 FROM outdoors
 ORDER BY content_embedding <=> $1
 LIMIT $2
 """
+
+
+def _row_to_dict(row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "body": row["body"],
+        "score": float(row["score"]),
+        "item_type": row.get("item_type") if isinstance(row, dict) else row["item_type"],
+        "is_accepted": row["is_accepted"],
+        "parent_id": row["parent_id"],
+        "tags": list(row["tags"] or []),
+        "upvotes": int(row["upvotes"] or 0),
+    }
 
 
 async def search_by_vector(
@@ -29,15 +48,7 @@ async def search_by_vector(
     arr = np.array(vector, dtype=np.float32)
     async with pool.acquire() as conn:
         rows = await conn.fetch(VECTOR_SQL, arr, k)
-    return [
-        {
-            "id": row["id"],
-            "title": row["title"],
-            "body": row["body"],
-            "score": float(row["score"]),
-        }
-        for row in rows
-    ]
+    return [_row_to_dict(r) for r in rows]
 
 
 # -----------------------------------------------------------------------------
@@ -54,6 +65,12 @@ async def search_by_vector(
 # names) aren't dropped just because the vector side didn't surface them, and
 # vice versa.
 
+# Hybrid: vector cosine + BM25, fused by Reciprocal Rank Fusion (k=60),
+# then small additive bumps for authority signals so high-quality answers
+# outrank equally-ranked low-quality ones:
+#   +0.005  if is_accepted          (about 1/4 of a full rank, deliberate
+#                                    bump without dominating retrieval)
+#   +0.002 * log1p(upvotes)         (caps out around +0.01 at 150 upvotes)
 HYBRID_SQL = """
 WITH vector_hits AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY content_embedding <=> $1) AS rnk
@@ -72,7 +89,17 @@ keyword_hits AS (
 SELECT o.id,
        o.title,
        o.body,
-       COALESCE(1.0 / (60 + v.rnk), 0) + COALESCE(1.0 / (60 + k.rnk), 0) AS score,
+       o.item_type,
+       o.is_accepted,
+       o.parent_id,
+       o.tags,
+       o.score AS upvotes,
+       (
+           COALESCE(1.0 / (60 + v.rnk), 0)
+         + COALESCE(1.0 / (60 + k.rnk), 0)
+         + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
+         + 0.002 * ln(1 + GREATEST(o.score, 0))
+       ) AS score,
        v.rnk AS vector_rank,
        k.rnk AS keyword_rank
 FROM outdoors o
@@ -91,28 +118,16 @@ async def hybrid_search(
     k_retrieve: int = 50,
     k_final: int = 50,
 ) -> list[dict[str, Any]]:
-    """Fuse vector + keyword retrieval via RRF.
-
-    `k_retrieve` is how many each side fetches before fusion.
-    `k_final` is how many the fused SELECT returns.
-
-    If you're feeding this into a reranker, keep k_final == k_retrieve so
-    the reranker sees the full fused pool.
-    """
     arr = np.array(vector, dtype=np.float32)
     async with pool.acquire() as conn:
         rows = await conn.fetch(HYBRID_SQL, arr, k_retrieve, query, k_final)
-    return [
-        {
-            "id": row["id"],
-            "title": row["title"],
-            "body": row["body"],
-            "score": float(row["score"]),
-            "vector_rank": row["vector_rank"],
-            "keyword_rank": row["keyword_rank"],
-        }
-        for row in rows
-    ]
+    results = []
+    for row in rows:
+        d = _row_to_dict(row)
+        d["vector_rank"] = row["vector_rank"]
+        d["keyword_rank"] = row["keyword_rank"]
+        results.append(d)
+    return results
 
 
 async def semantic_search(

@@ -23,9 +23,19 @@
           <li>
             <div class="title-row">
               <span class="chip">{{ '%.3f' % r.score }}</span>
-              <span class="title">{{ r.title }}</span>
+              {% if r.is_accepted %}
+                <span class="badge badge-accepted" title="Accepted answer">✓ Accepted</span>
+              {% elif r.item_type == 'answer' %}
+                <span class="badge badge-answer">Answer</span>
+              {% else %}
+                <span class="badge badge-question">Question</span>
+              {% endif %}
+              {% if r.upvotes is defined and r.upvotes > 0 %}
+                <span class="badge badge-muted" title="Upvotes">▲ {{ r.upvotes }}</span>
+              {% endif %}
+              <span class="title">{{ r.title if r.title else (r.body | truncate(80)) }}</span>
             </div>
-            {% if r.body %}
+            {% if r.body and r.title %}
               <div class="body">{{ r.body | truncate(320) }}</div>
             {% endif %}
           </li>

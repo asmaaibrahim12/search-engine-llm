@@ -40,7 +40,29 @@ def test_build_prompt_interpolates_query_and_body():
 def test_build_prompt_handles_missing_body():
     results = [{"title": "Only a title", "body": None}]
     prompt = rag.build_prompt("q", results, k=1)
-    assert "[1] Only a title:" in prompt
+    assert "[1 — question] Only a title:" in prompt
+
+
+def test_build_prompt_marks_accepted_answers():
+    results = [
+        {"title": "Q", "body": "q body", "item_type": "question", "is_accepted": False},
+        {"title": None, "body": "a body", "item_type": "answer", "is_accepted": True},
+        {"title": None, "body": "a2 body", "item_type": "answer", "is_accepted": False},
+    ]
+    prompt = rag.build_prompt("q", results, k=3)
+    assert "[1 — question]" in prompt
+    assert "[2 — accepted answer]" in prompt
+    assert "[3 — answer]" in prompt
+
+
+def test_build_prompt_answer_without_title_does_not_leak_colon():
+    """Answers have no title, so the citation line shouldn't have the
+    'title: body' form that works for questions."""
+    results = [{"title": None, "body": "answer text", "item_type": "answer"}]
+    prompt = rag.build_prompt("q", results, k=1)
+    # No dangling colon right after the citation header
+    assert "[1 — answer] answer text" in prompt
+    assert "[1 — answer] :" not in prompt
 
 
 @pytest.mark.asyncio

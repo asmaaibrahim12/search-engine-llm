@@ -11,7 +11,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS outdoors (
     id BIGINT PRIMARY KEY,
-    title TEXT NOT NULL,
+    title TEXT,
     body TEXT,
     content_embedding vector(768),
     content_tsv tsvector
@@ -19,6 +19,20 @@ CREATE TABLE IF NOT EXISTS outdoors (
 
 -- Drop legacy title-only column from earlier schemas, if it's still around.
 ALTER TABLE outdoors DROP COLUMN IF EXISTS title_embedding;
+
+-- Title is NULL for answers. Drop the NOT NULL constraint if it's still on
+-- the column from an earlier schema.
+ALTER TABLE outdoors ALTER COLUMN title DROP NOT NULL;
+
+-- New metadata columns (added idempotently so re-deploying is safe).
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS parent_id BIGINT;
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS item_type TEXT
+    NOT NULL DEFAULT 'question'
+    CHECK (item_type IN ('question', 'answer'));
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS score INT NOT NULL DEFAULT 0;
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS is_accepted BOOLEAN
+    NOT NULL DEFAULT FALSE;
+ALTER TABLE outdoors ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}';
 
 -- Backfill content_tsv for rows inserted before the column existed.
 UPDATE outdoors
@@ -36,8 +50,12 @@ CREATE INDEX IF NOT EXISTS outdoors_content_embedding_idx
 CREATE INDEX IF NOT EXISTS outdoors_content_tsv_idx
     ON outdoors USING GIN (content_tsv);
 
--- Keep content_tsv in sync with title and body via trigger, so the indexer
--- (and any ad-hoc INSERT/UPDATE) doesn't have to know about the tsvector.
+-- Secondary indexes for filters + parent lookups.
+CREATE INDEX IF NOT EXISTS outdoors_parent_id_idx ON outdoors (parent_id);
+CREATE INDEX IF NOT EXISTS outdoors_tags_idx ON outdoors USING GIN (tags);
+CREATE INDEX IF NOT EXISTS outdoors_item_type_idx ON outdoors (item_type);
+
+-- Keep content_tsv in sync with title/body via trigger.
 CREATE OR REPLACE FUNCTION outdoors_tsv_refresh() RETURNS trigger AS $$
 BEGIN
     NEW.content_tsv := to_tsvector(

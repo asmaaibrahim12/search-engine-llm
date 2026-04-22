@@ -75,10 +75,54 @@ async def test_semantic_search_score_in_valid_range(pool):
 async def test_semantic_search_returns_expected_fields(pool):
     await _seed(pool, [{"id": 42, "title": "sample", "body": "sample body"}])
     results = await search.semantic_search(pool, "sample", k=1)
-    assert set(results[0].keys()) == {"id", "title", "body", "score"}
+    expected = {
+        "id", "title", "body", "score",
+        "item_type", "is_accepted", "parent_id", "tags", "upvotes",
+    }
+    assert set(results[0].keys()) >= expected
     assert results[0]["id"] == 42
     assert results[0]["title"] == "sample"
     assert results[0]["body"] == "sample body"
+    assert results[0]["item_type"] == "question"  # default from schema
+
+
+async def test_accepted_answer_outranks_plain_answer_on_ties(pool):
+    """Two identical-body answers; only one marked accepted. Accepted wins."""
+    from app.embeddings import embed_query
+
+    # Same body text -> near-identical vector and keyword scores. The
+    # +0.005 accepted boost is what breaks the tie.
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+    await _seed(pool, [
+        {"id": 1, "title": "How to lace hiking boots"},
+    ])
+    # Manually insert two near-identical answers; flip accepted on one.
+    from app.embeddings import embed_batch
+    bodies = ["Use surgeon's knot at the ankle hooks for a snug fit.",
+              "Use surgeon's knot at the ankle hooks for a snug fit."]
+    vecs = embed_batch(bodies)
+    records = [
+        (2, 1, "answer", None, bodies[0], 5, False, [], np.array(vecs[0], dtype=np.float32)),
+        (3, 1, "answer", None, bodies[1], 5, True,  [], np.array(vecs[1], dtype=np.float32)),
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO outdoors (id, parent_id, item_type, title, body, "
+            "score, is_accepted, tags, content_embedding) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            records,
+        )
+
+    vec = embed_query("lace hiking boots tight")
+    results = await search.hybrid_search(
+        pool, "lace hiking boots tight", vec, k_retrieve=10, k_final=10
+    )
+    # Accepted answer should come above the non-accepted one
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[3] < positions[2], (
+        f"accepted answer should rank above plain answer, got {results}"
+    )
 
 
 # -----------------------------------------------------------------------------

@@ -257,6 +257,39 @@
         font-weight: 500;
         flex-shrink: 0;
       }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+        flex-shrink: 0;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--ink-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .badge-accepted {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        border-color: transparent;
+      }
+      .badge-answer {
+        background: var(--surface);
+        color: var(--ink);
+        border-color: var(--border);
+      }
+      .badge-question {
+        background: transparent;
+        color: var(--ink-muted);
+      }
+      .badge-muted {
+        background: transparent;
+        color: var(--ink-muted);
+        text-transform: none;
+        font-family: var(--mono);
+      }
 
       /* Behind-the-scenes trace panel */
       .trace { position: sticky; top: 24px; align-self: flex-start; min-width: 0; }
