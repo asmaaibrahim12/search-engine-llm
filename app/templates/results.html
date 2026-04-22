@@ -57,10 +57,10 @@
               {% if r.upvotes is defined and r.upvotes > 0 %}
                 <span class="badge badge-muted" title="Upvotes">▲ {{ r.upvotes }}</span>
               {% endif %}
-              <span class="title">{{ r.title if r.title else (r.body | truncate(80)) }}</span>
+              <span class="title">{{ r.title if r.title else (r.body | strip_html | truncate(80)) }}</span>
             </div>
             {% if r.body and r.title %}
-              <div class="body">{{ r.body | truncate(320) }}</div>
+              <div class="body">{{ r.body | strip_html | truncate(320) }}</div>
             {% endif %}
             <div class="thumbs" onclick="event.preventDefault()">
               <button

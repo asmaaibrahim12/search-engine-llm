@@ -65,6 +65,32 @@ def test_build_prompt_answer_without_title_does_not_leak_colon():
     assert "[1 — answer] :" not in prompt
 
 
+def test_build_prompt_strips_html_from_body():
+    """Stack Exchange bodies are HTML — the prompt must not waste tokens
+    on markup, and must feed clean text to Claude."""
+    results = [{
+        "title": "T",
+        "body": "<p>body <em>text</em></p>&#xA;with <code>markup</code>",
+        "item_type": "question",
+    }]
+    prompt = rag.build_prompt("q", results, k=1)
+    assert "<p>" not in prompt
+    assert "<em>" not in prompt
+    assert "&#xA;" not in prompt
+    assert "body text" in prompt
+    assert "with markup" in prompt
+
+
+def test_build_prompt_caps_body_length():
+    """Long bodies get truncated so one rambling answer can't eat the
+    whole prompt budget."""
+    long_body = "x " * 1000
+    results = [{"title": "T", "body": long_body, "item_type": "answer"}]
+    prompt = rag.build_prompt("q", results, k=1)
+    # Truncation cap is 600 chars; assert we're well under original length
+    assert len(prompt) < 1500
+
+
 @pytest.mark.asyncio
 async def test_stream_summary_yields_tokens(fake_claude):
     fake_claude._tokens = ["Hel", "lo", " world"]
@@ -83,7 +109,7 @@ async def test_stream_summary_uses_opus_4_7_and_max_tokens(fake_claude):
     # max_tokens is deliberately small to keep summaries to a few sentences,
     # not a multi-section essay. If this goes up, the UI text will explode.
     assert kwargs["max_tokens"] == rag.MAX_TOKENS
-    assert kwargs["max_tokens"] <= 1000
+    assert kwargs["max_tokens"] <= 500
 
 
 @pytest.mark.asyncio

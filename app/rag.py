@@ -5,17 +5,21 @@ from typing import AsyncIterator, Iterable, Mapping
 
 import anthropic
 
+from app.text import strip_html
+
 MODEL = "claude-opus-4-7"
-MAX_TOKENS = 600  # ~3-5 sentences. Hard cap to prevent multi-section essays.
+MAX_TOKENS = 400  # ~2-3 sentences. Hard cap so the UI can't ever render a
+                  # multi-section essay, regardless of prompt adherence.
 
-PROMPT_TEMPLATE = """Answer the user's query in 2-4 sentences, grounded only in the search results below.
+PROMPT_TEMPLATE = """Answer the user's query in at most two short sentences. Write one plain paragraph.
 
-Rules:
-- Cite claims inline with [1], [2], etc., matching the numbered results.
-- Plain prose only. No headings, no bullet lists, no "Overview" or "Conclusion" sections.
-- Prefer results marked "accepted answer" or "answer" over those marked "question".
-- If the results don't actually answer the query, say so in one sentence.
-- Be direct. No preamble like "Based on the search results…".
+Hard rules — violating any is a failure:
+- NO headings. Do not emit '#', '##', '###', or labels like 'Overview', 'Summary', 'Conclusion', 'Key Points'.
+- NO bullet points or numbered lists.
+- NO preamble like 'Based on the search results…'. Start with the answer.
+- Cite inline using the bracketed tags: [1], [2], etc.
+- Prefer results tagged 'accepted answer' or 'answer' over 'question' when they conflict.
+- If the results do not address the query, say so in one sentence and stop.
 
 ## Query
 {query}
@@ -52,9 +56,10 @@ def build_prompt(
     parts = []
     for i, r in enumerate(top):
         header = _citation_header(i + 1, r)
-        title = r.get("title") or ""
-        body = r.get("body") or ""
-        # Answers have no title; present the body with the header only.
+        title = (r.get("title") or "").strip()
+        # Strip HTML from body before the LLM sees it — Stack Exchange
+        # bodies are stored as HTML, which is wasted tokens and noise.
+        body = strip_html(r.get("body"))[:600]
         if title:
             parts.append(f"{header} {title}: {body}\n")
         else:

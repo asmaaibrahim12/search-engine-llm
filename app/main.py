@@ -17,6 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app import embeddings, events, rag, rerank, search
 from app.db import create_pool, ensure_schema
+from app.text import strip_html
 
 load_dotenv()
 
@@ -40,6 +41,9 @@ def _clean_item_types(types: Optional[List[str]]) -> Optional[list[str]]:
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+# Expose strip_html to templates so result bodies don't render raw HTML
+# markup (Stack Exchange stores bodies as HTML).
+templates.env.filters["strip_html"] = strip_html
 
 # Pipeline constants
 RETRIEVE_K = 50   # candidates fetched by the retriever (vector / hybrid)
