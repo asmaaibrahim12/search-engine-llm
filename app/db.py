@@ -138,15 +138,33 @@ CREATE INDEX IF NOT EXISTS search_events_query_idx
 
 DROP MATERIALIZED VIEW IF EXISTS result_ctr;
 CREATE MATERIALIZED VIEW result_ctr AS
-WITH engagements AS (
+WITH deduped_engagements AS (
+    -- Collapse repeated engagement events from the same session into one
+    -- per kind. Rationale:
+    --   * A user double-clicks a result → 2 rows, 1 click's worth of signal.
+    --   * A user toggles 👍 → 👎 → 👍 → 3 rows, only the LATEST counts.
+    -- Raw log rows stay in search_events for audit / future models; the
+    -- ranking signal here is the deduped view of intent.
+    SELECT DISTINCT ON (
+        session_id, query, result_id,
+        CASE WHEN event_type = 'click' THEN 'click' ELSE 'thumb' END
+    )
+        result_id, event_type
+    FROM search_events
+    WHERE result_id IS NOT NULL
+      AND event_type IN ('click', 'thumb_up', 'thumb_down')
+    ORDER BY
+        session_id, query, result_id,
+        CASE WHEN event_type = 'click' THEN 'click' ELSE 'thumb' END,
+        occurred_at DESC
+),
+engagements AS (
     SELECT
         result_id,
         COUNT(*) FILTER (WHERE event_type = 'click')      AS clicks,
         COUNT(*) FILTER (WHERE event_type = 'thumb_up')   AS thumbs_up,
         COUNT(*) FILTER (WHERE event_type = 'thumb_down') AS thumbs_down
-    FROM search_events
-    WHERE result_id IS NOT NULL
-      AND event_type IN ('click', 'thumb_up', 'thumb_down')
+    FROM deduped_engagements
     GROUP BY result_id
 ),
 impressions AS (

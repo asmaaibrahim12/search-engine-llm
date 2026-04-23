@@ -385,12 +385,19 @@ async def test_top_tags_empty_db(pool):
 # -----------------------------------------------------------------------------
 
 
-async def _insert_event(pool, *, result_id: int, event_type: str) -> None:
+async def _insert_event(
+    pool,
+    *,
+    result_id: int,
+    event_type: str,
+    session_id: str = "t",
+    query: str = "q",
+) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO search_events (session_id, query, event_type, result_id) "
-            "VALUES ('t', 'q', $1, $2)",
-            event_type, result_id,
+            "VALUES ($1, $2, $3, $4)",
+            session_id, query, event_type, result_id,
         )
 
 
@@ -423,9 +430,12 @@ async def test_hybrid_search_click_bump_breaks_ties(pool):
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             records,
         )
-    # Log a handful of clicks on id=11; none on id=10.
-    for _ in range(5):
-        await _insert_event(pool, result_id=11, event_type="click")
+    # Log clicks on id=11 from 5 distinct sessions; none on id=10.
+    # Distinct sessions are necessary because the MV dedupes repeat
+    # clicks from the same session into one.
+    for i in range(5):
+        await _insert_event(pool, result_id=11, event_type="click",
+                             session_id=f"s{i}")
     await _refresh_ctr(pool)
 
     vec = embed_query("lace hiking boots")
@@ -449,8 +459,10 @@ async def test_hybrid_search_thumb_down_demotes(pool):
         {"id": 20, "title": "best rain jacket for spring hikes"},
         {"id": 21, "title": "best rain jacket for spring hikes"},
     ])
-    for _ in range(4):
-        await _insert_event(pool, result_id=20, event_type="thumb_down")
+    # Distinct sessions so dedup doesn't collapse them to one thumb_down.
+    for i in range(4):
+        await _insert_event(pool, result_id=20, event_type="thumb_down",
+                             session_id=f"d{i}")
     await _refresh_ctr(pool)
 
     vec = embed_query("rain jacket spring")
@@ -487,10 +499,13 @@ async def test_hybrid_search_ctr_rate_beats_raw_clicks(pool):
         {"id": 30, "title": "best backpack for thru-hiking"},
         {"id": 31, "title": "best backpack for thru-hiking"},
     ])
-    # Both get 5 clicks, same thumb state.
-    for _ in range(5):
-        await _insert_event(pool, result_id=30, event_type="click")
-        await _insert_event(pool, result_id=31, event_type="click")
+    # Both get 5 clicks from distinct sessions (one session per click, so
+    # MV dedup doesn't swallow them) — same thumb state.
+    for i in range(5):
+        await _insert_event(pool, result_id=30, event_type="click",
+                             session_id=f"a{i}")
+        await _insert_event(pool, result_id=31, event_type="click",
+                             session_id=f"b{i}")
     # id=30 shown 10 times (CTR 0.5); id=31 shown 200 times (CTR 0.025).
     for _ in range(10):
         await _insert_search_impression(pool, result_ids=[30])
@@ -507,6 +522,69 @@ async def test_hybrid_search_ctr_rate_beats_raw_clicks(pool):
         f"higher-CTR doc (5/10) should outrank lower-CTR doc (5/200), "
         f"got {results}"
     )
+
+
+async def test_result_ctr_dedupes_same_session_clicks(pool):
+    """Many clicks on the same result by the same session should count as one
+    in the MV, so one hyperactive tab can't inflate the click bump."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    # 10 clicks from one session on result 40 + 1 click from a different
+    # session on the same result.
+    for _ in range(10):
+        await _insert_event(pool, result_id=40, event_type="click",
+                             session_id="hyper", query="same")
+    await _insert_event(pool, result_id=40, event_type="click",
+                         session_id="other", query="same")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT clicks FROM result_ctr WHERE result_id = 40"
+        )
+    assert row is not None
+    # 2 distinct (session, query) keys → 2 clicks, not 11.
+    assert row["clicks"] == 2
+
+
+async def test_result_ctr_thumb_toggle_keeps_only_latest(pool):
+    """thumb_up → thumb_down should count as 1 thumb_down, not 1 of each."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _insert_event(pool, result_id=50, event_type="thumb_up",
+                         session_id="flip", query="same")
+    # Ensure a strictly-later occurred_at so DISTINCT ON picks the down vote.
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.01)
+    await _insert_event(pool, result_id=50, event_type="thumb_down",
+                         session_id="flip", query="same")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT thumbs_up, thumbs_down FROM result_ctr WHERE result_id = 50"
+        )
+    assert row["thumbs_up"] == 0
+    assert row["thumbs_down"] == 1
+
+
+async def test_result_ctr_clicks_and_thumbs_both_count_for_same_session(pool):
+    """Dedup partitions clicks and thumbs separately — a user who both clicks
+    AND thumbs-up the same result should contribute one of each."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _insert_event(pool, result_id=60, event_type="click",
+                         session_id="s", query="q")
+    await _insert_event(pool, result_id=60, event_type="thumb_up",
+                         session_id="s", query="q")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT clicks, thumbs_up FROM result_ctr WHERE result_id = 60"
+        )
+    assert row["clicks"] == 1
+    assert row["thumbs_up"] == 1
 
 
 async def test_hybrid_search_empty_ctr_is_noop(pool):

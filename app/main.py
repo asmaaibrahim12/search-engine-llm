@@ -412,6 +412,63 @@ async def admin_refresh_ctr(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/admin/metrics")
+async def admin_metrics(request: Request) -> JSONResponse:
+    """Feedback-loop health at a glance.
+
+    Returns:
+      - event_counts: total + last-24h count per event_type
+      - ctr_rows: how many result_ids the MV has coverage for
+      - recent_search_latency_ms: mean + p95 over the last 24h of
+        'search' events (only rows where latency_ms is non-null)
+    Cheap enough for a dashboard ping every few seconds; both queries hit
+    the existing search_events indexes.
+    """
+    _require_admin(request)
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        event_rows = await conn.fetch(
+            """
+            SELECT event_type,
+                   COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '24 hours')
+                       AS last_24h,
+                   COUNT(*) AS total
+            FROM search_events
+            GROUP BY event_type
+            ORDER BY event_type
+            """
+        )
+        ctr_rows = await conn.fetchval("SELECT COUNT(*) FROM result_ctr")
+        latency = await conn.fetchrow(
+            """
+            SELECT AVG(latency_ms)::int AS mean_ms,
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::int
+                       AS p95_ms,
+                   COUNT(*) AS n
+            FROM search_events
+            WHERE event_type = 'search'
+              AND latency_ms IS NOT NULL
+              AND occurred_at >= NOW() - INTERVAL '24 hours'
+            """
+        )
+    return JSONResponse({
+        "event_counts": [
+            {
+                "event_type": r["event_type"],
+                "last_24h": int(r["last_24h"]),
+                "total": int(r["total"]),
+            }
+            for r in event_rows
+        ],
+        "ctr_rows": int(ctr_rows or 0),
+        "recent_search_latency_ms": {
+            "n": int(latency["n"] or 0),
+            "mean": int(latency["mean_ms"] or 0) if latency["n"] else None,
+            "p95":  int(latency["p95_ms"]  or 0) if latency["n"] else None,
+        },
+    })
+
+
 @app.get("/admin/stats/{result_id}")
 async def admin_stats(request: Request, result_id: int) -> JSONResponse:
     """Inspect the CTR MV row for one result_id.

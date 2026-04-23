@@ -67,6 +67,23 @@ def test_session_is_reminted_when_cookie_wrong_length():
     assert events._is_uuid(sid)
 
 
+def test_cookie_secure_defaults_to_false(monkeypatch):
+    """Local dev (HTTP) must NOT set Secure or browsers drop the cookie."""
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+    req = _make_request()
+    resp = Response()
+    events.get_or_create_session(req, resp)
+    assert "secure" not in resp.headers["set-cookie"].lower()
+
+
+def test_cookie_secure_set_when_env_enabled(monkeypatch):
+    monkeypatch.setenv("COOKIE_SECURE", "1")
+    req = _make_request()
+    resp = Response()
+    events.get_or_create_session(req, resp)
+    assert "secure" in resp.headers["set-cookie"].lower()
+
+
 def test_rate_limit_allows_up_to_quota():
     events._buckets.clear()
     sid = "test-session-allow"

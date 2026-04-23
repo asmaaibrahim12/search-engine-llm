@@ -173,6 +173,46 @@ async def test_admin_stats_returns_not_found_for_unseen_id(app_client, monkeypat
     assert body == {"result_id": 999999, "found": False}
 
 
+async def test_admin_metrics_requires_token(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.get("/admin/metrics")
+    assert r.status_code == 403
+
+
+async def test_admin_metrics_returns_expected_shape(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+            # One search with 120ms latency, two clicks, one thumb_up.
+            await conn.execute(
+                "INSERT INTO search_events (session_id, query, event_type, "
+                "latency_ms) VALUES ('s', 'q', 'search', 120)"
+            )
+            await conn.execute(
+                "INSERT INTO search_events (session_id, query, event_type, "
+                "result_id) VALUES ('s', 'q', 'click', 1), ('s', 'q', 'click', 2), "
+                "('s', 'q', 'thumb_up', 1)"
+            )
+            await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+    finally:
+        await pool.close()
+
+    r = await app_client.get(
+        "/admin/metrics", headers={"X-Admin-Token": "s3cret"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    types = {row["event_type"]: row for row in body["event_counts"]}
+    assert types["search"]["total"] >= 1
+    assert types["click"]["total"] >= 2
+    assert types["thumb_up"]["total"] >= 1
+    assert body["ctr_rows"] >= 1  # id=1 has events, so it's in the MV
+    assert body["recent_search_latency_ms"]["n"] >= 1
+    assert body["recent_search_latency_ms"]["mean"] is not None
+
+
 async def test_admin_stats_returns_row_after_events(app_client, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
     pool = await create_pool(TEST_DATABASE_URL)
