@@ -71,14 +71,16 @@ async def search_by_vector(
 #   +0.005  if is_accepted          (about 1/4 of a full rank, deliberate
 #                                    bump without dominating retrieval)
 #   +0.002 * log1p(upvotes)         (caps out around +0.01 at 150 upvotes)
-#   +0.003 * log1p(clicks)          (feedback-loop signal from search_events
-#                                    via the result_ctr materialized view;
-#                                    log-shrunk so long-tail noise stays small
-#                                    and a popular result gets a few hundredths)
+#   +0.010 * clicks / max(impressions, 20)
+#                                   (feedback-loop CTR from result_ctr;
+#                                    denominator floor of 20 acts as a
+#                                    shrinkage prior — rare items don't
+#                                    get a huge bump from 1/1 CTR; max
+#                                    bump ≈ +0.010 at 100% CTR)
 #   +0.003 * (log1p(thumbs_up) - log1p(thumbs_down))
-#                                   (net thumb signal, same log shrinkage —
-#                                    bounded by the size of both counts and
-#                                    symmetric around zero)
+#                                   (net thumb signal, log-shrunk so one
+#                                    thumb doesn't dominate, symmetric
+#                                    around zero)
 HYBRID_SQL = """
 WITH vector_hits AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY content_embedding <=> $1) AS rnk
@@ -107,7 +109,10 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.003 * ln(1 + COALESCE(f.clicks, 0))
+         + 0.010 * (
+               COALESCE(f.clicks, 0)::float
+             / GREATEST(COALESCE(f.impressions, 0), 20)
+           )
          + 0.003 * (
                ln(1 + COALESCE(f.thumbs_up, 0))
              - ln(1 + COALESCE(f.thumbs_down, 0))
@@ -163,7 +168,10 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.003 * ln(1 + COALESCE(f.clicks, 0))
+         + 0.010 * (
+               COALESCE(f.clicks, 0)::float
+             / GREATEST(COALESCE(f.impressions, 0), 20)
+           )
          + 0.003 * (
                ln(1 + COALESCE(f.thumbs_up, 0))
              - ln(1 + COALESCE(f.thumbs_down, 0))

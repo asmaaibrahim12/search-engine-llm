@@ -463,6 +463,52 @@ async def test_hybrid_search_thumb_down_demotes(pool):
     )
 
 
+async def _insert_search_impression(pool, *, result_ids: list[int]) -> None:
+    import json as _json
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO search_events (session_id, query, event_type, metadata) "
+            "VALUES ('t', 'q', 'search', $1::jsonb)",
+            _json.dumps({"result_ids": result_ids}),
+        )
+
+
+async def test_hybrid_search_ctr_rate_beats_raw_clicks(pool):
+    """Two docs with identical 5 clicks each: the one shown far fewer times
+    (higher CTR) should outrank the one shown many times (low CTR). This
+    is the whole point of using impressions as a denominator, not raw
+    click counts."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 30, "title": "best backpack for thru-hiking"},
+        {"id": 31, "title": "best backpack for thru-hiking"},
+    ])
+    # Both get 5 clicks, same thumb state.
+    for _ in range(5):
+        await _insert_event(pool, result_id=30, event_type="click")
+        await _insert_event(pool, result_id=31, event_type="click")
+    # id=30 shown 10 times (CTR 0.5); id=31 shown 200 times (CTR 0.025).
+    for _ in range(10):
+        await _insert_search_impression(pool, result_ids=[30])
+    for _ in range(200):
+        await _insert_search_impression(pool, result_ids=[31])
+    await _refresh_ctr(pool)
+
+    vec = embed_query("backpack thru-hiking")
+    results = await search.hybrid_search(
+        pool, "backpack thru-hiking", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[30] < positions[31], (
+        f"higher-CTR doc (5/10) should outrank lower-CTR doc (5/200), "
+        f"got {results}"
+    )
+
+
 async def test_hybrid_search_empty_ctr_is_noop(pool):
     """With no events logged, ranking should match the pre-feedback behavior:
     RRF score bounded by 2/61 when a doc is rank 1 in both halves."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -16,7 +17,9 @@ from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
 from app import embeddings, events, rag, rerank, search
-from app.db import create_pool, ensure_schema
+from app.db import (
+    create_pool, ensure_schema, refresh_result_ctr, result_ctr_refresh_loop,
+)
 from app.text import strip_html
 
 load_dotenv()
@@ -64,9 +67,25 @@ async def lifespan(app: FastAPI):
         app.state.top_tags = await search.top_tags(app.state.pool, limit=30)
     except Exception:
         app.state.top_tags = []
+    # Build result_ctr once at boot (ensure_schema above drops+recreates
+    # the MV empty) and then keep it fresh on a timer. Interval is tunable
+    # via env; the default is a gentle 5 minutes. Set to 0 to disable.
+    await refresh_result_ctr(app.state.pool)
+    refresh_interval_s = int(os.environ.get("RESULT_CTR_REFRESH_SEC", "300"))
+    refresh_task: asyncio.Task | None = None
+    if refresh_interval_s > 0:
+        refresh_task = asyncio.create_task(
+            result_ctr_refresh_loop(app.state.pool, refresh_interval_s)
+        )
     try:
         yield
     finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await app.state.pool.close()
 
 

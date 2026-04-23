@@ -115,25 +115,58 @@ CREATE INDEX IF NOT EXISTS search_events_query_idx
 -- ---------------------------------------------------------------------------
 --
 -- Populated from search_events. The hybrid retriever LEFT JOINs this view
--- and adds a log-shrunk bump based on clicks + net thumbs, letting the
--- pipeline close the feedback loop without touching the hot path.
+-- and adds a small rate-based click bump plus a log-shrunk net-thumb bump,
+-- letting the pipeline close the feedback loop without touching the hot
+-- path.
 --
 -- It's a MATERIALIZED VIEW (not a regular view) so the retrieval query
--- doesn't have to aggregate over search_events on every call. Refresh on
--- a schedule — see refresh_result_ctr() — not inline on write. Starts
--- empty; the LEFT JOIN + COALESCE means zero rows is a no-op, not an
--- error.
+-- doesn't aggregate over search_events on every call. Refresh on a
+-- schedule — see refresh_result_ctr() + the lifespan refresh loop in
+-- main.py — not inline on write.
+--
+-- Impressions are derived from the `result_ids` array we now stash in the
+-- metadata of each 'search' event. A FULL OUTER JOIN against the click /
+-- thumb aggregate means a row can appear even if it was only impressed
+-- (impressions > 0, clicks = 0) OR only engaged with (e.g. thumbs without
+-- a paired search row, as can happen for older rows pre-dating the
+-- metadata change).
+--
+-- Materialized view definitions can't be altered in place (Postgres won't
+-- let you swap the SELECT), so we DROP + CREATE unconditionally. The MV
+-- is a pure derivation of search_events — rebuilding it is cheap and the
+-- lifespan refreshes it right after ensure_schema() runs.
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS result_ctr AS
+DROP MATERIALIZED VIEW IF EXISTS result_ctr;
+CREATE MATERIALIZED VIEW result_ctr AS
+WITH engagements AS (
+    SELECT
+        result_id,
+        COUNT(*) FILTER (WHERE event_type = 'click')      AS clicks,
+        COUNT(*) FILTER (WHERE event_type = 'thumb_up')   AS thumbs_up,
+        COUNT(*) FILTER (WHERE event_type = 'thumb_down') AS thumbs_down
+    FROM search_events
+    WHERE result_id IS NOT NULL
+      AND event_type IN ('click', 'thumb_up', 'thumb_down')
+    GROUP BY result_id
+),
+impressions AS (
+    SELECT
+        (v.value)::text::bigint AS result_id,
+        COUNT(*) AS impressions
+    FROM search_events e,
+         jsonb_array_elements(e.metadata -> 'result_ids') AS v
+    WHERE e.event_type = 'search'
+      AND jsonb_typeof(e.metadata -> 'result_ids') = 'array'
+    GROUP BY 1
+)
 SELECT
-    result_id,
-    COUNT(*) FILTER (WHERE event_type = 'click')      AS clicks,
-    COUNT(*) FILTER (WHERE event_type = 'thumb_up')   AS thumbs_up,
-    COUNT(*) FILTER (WHERE event_type = 'thumb_down') AS thumbs_down
-FROM search_events
-WHERE result_id IS NOT NULL
-  AND event_type IN ('click', 'thumb_up', 'thumb_down')
-GROUP BY result_id;
+    COALESCE(e.result_id, i.result_id) AS result_id,
+    COALESCE(e.clicks, 0)              AS clicks,
+    COALESCE(e.thumbs_up, 0)           AS thumbs_up,
+    COALESCE(e.thumbs_down, 0)         AS thumbs_down,
+    COALESCE(i.impressions, 0)         AS impressions
+FROM engagements e
+FULL OUTER JOIN impressions i ON i.result_id = e.result_id;
 
 -- Unique index is required for REFRESH ... CONCURRENTLY.
 CREATE UNIQUE INDEX IF NOT EXISTS result_ctr_result_id_idx
@@ -192,7 +225,6 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
 async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
     """Recompute the result_ctr materialized view from search_events.
 
-    Call this on a schedule (e.g. hourly from a cron / Railway job).
     CONCURRENTLY avoids blocking readers; it's safe because the unique
     index on result_id lets Postgres diff old vs. new rows.
 
@@ -210,3 +242,24 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
                 await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
     except Exception as exc:
         print(f"refresh_result_ctr failed: {exc!r}", flush=True)
+
+
+async def result_ctr_refresh_loop(
+    pool: asyncpg.Pool, interval_s: int
+) -> None:
+    """Periodically refresh result_ctr in the background.
+
+    Meant to be scheduled from main.lifespan via asyncio.create_task.
+    Sleeps first so an initial refresh (done explicitly at startup) isn't
+    immediately re-run. Cancellation during sleep/refresh is the normal
+    shutdown path; anything else we log and continue so a single bad
+    refresh doesn't kill the loop for the rest of the process lifetime.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            await refresh_result_ctr(pool)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"result_ctr refresh loop: {exc!r}", flush=True)
