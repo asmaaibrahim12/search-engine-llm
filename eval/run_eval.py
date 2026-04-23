@@ -96,11 +96,52 @@ async def run_pipeline(
         t0 = time.perf_counter()
         results = await pipeline(pool, q["query"])
         latency = int((time.perf_counter() - t0) * 1000)
-        m = score_one(results, q["must_match_any"])
+        m = score_one(
+            results,
+            q.get("must_match_any", []),
+            q.get("must_match_ids"),
+        )
         m.query = q["query"]
         m.latency_ms = latency
         out.append(m)
     return out
+
+
+async def load_feedback_queries(
+    pool, min_thumbs_up: int = 1
+) -> list[dict]:
+    """Build eval queries from production feedback.
+
+    Aggregates thumbs_up events from search_events into one query per
+    unique (case-normalized) query string, with the thumbed-up result ids
+    as must_match_ids. The min_thumbs_up threshold filters out single-vote
+    noise; bump it up once there's enough traffic.
+
+    Skips queries with no thumbs_up hits entirely — they'd be unscorable
+    without labels.
+    """
+    sql = """
+    SELECT lower(trim(query)) AS query_norm,
+           result_id,
+           COUNT(*) AS votes
+    FROM search_events
+    WHERE event_type = 'thumb_up'
+      AND result_id IS NOT NULL
+      AND query IS NOT NULL
+      AND length(trim(query)) > 0
+    GROUP BY 1, 2
+    HAVING COUNT(*) >= $1
+    ORDER BY 1, 3 DESC
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, min_thumbs_up)
+    by_query: dict[str, list[int]] = {}
+    for row in rows:
+        by_query.setdefault(row["query_norm"], []).append(int(row["result_id"]))
+    return [
+        {"query": q, "must_match_any": [], "must_match_ids": ids}
+        for q, ids in by_query.items()
+    ]
 
 
 def print_report(results_by_pipeline: dict[str, list[QueryMetrics]]) -> None:
@@ -130,9 +171,11 @@ def print_report(results_by_pipeline: dict[str, list[QueryMetrics]]) -> None:
 
 
 async def main_async(args) -> int:
-    with open(args.queries) as fh:
-        queries = json.load(fh)
-    print(f"Loaded {len(queries)} queries from {args.queries}", flush=True)
+    queries: list[dict] = []
+    if not args.feedback_only:
+        with open(args.queries) as fh:
+            queries = json.load(fh)
+        print(f"Loaded {len(queries)} queries from {args.queries}", flush=True)
 
     # Warm the models once
     embeddings.get_model()
@@ -142,6 +185,17 @@ async def main_async(args) -> int:
     pool = await create_pool()
     await ensure_schema(pool)
     try:
+        if args.augment_from_feedback or args.feedback_only:
+            fb = await load_feedback_queries(pool, min_thumbs_up=args.min_thumbs_up)
+            print(
+                f"Loaded {len(fb)} queries from search_events "
+                f"(>= {args.min_thumbs_up} thumbs_up)",
+                flush=True,
+            )
+            queries.extend(fb)
+        if not queries:
+            print("No queries to run — exiting.", flush=True)
+            return 0
         pipelines_to_run = (
             [args.pipeline] if args.pipeline else list(PIPELINES.keys())
         )
@@ -166,6 +220,24 @@ def main() -> None:
         choices=list(PIPELINES.keys()),
         default=None,
         help="Run only this pipeline. Default: all four.",
+    )
+    parser.add_argument(
+        "--augment-from-feedback",
+        action="store_true",
+        help="Also pull queries + positive labels from search_events (thumbs_up).",
+    )
+    parser.add_argument(
+        "--feedback-only",
+        action="store_true",
+        help="Ignore queries.json; evaluate ONLY on queries derived from "
+             "production thumbs_up events.",
+    )
+    parser.add_argument(
+        "--min-thumbs-up",
+        type=int,
+        default=1,
+        help="Minimum thumbs_up count per (query, result_id) to count as a "
+             "positive label. Raise this as traffic grows.",
     )
     args = parser.parse_args()
 

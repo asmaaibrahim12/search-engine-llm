@@ -19,9 +19,23 @@ class QueryMetrics:
     latency_ms: int
 
 
-def is_relevant(result: dict, must_match_any: list[str]) -> bool:
-    """A hit counts as relevant if its title or body contains any of the
-    required tokens (case-insensitive substring match)."""
+def is_relevant(
+    result: dict,
+    must_match_any: list[str],
+    must_match_ids: list[int] | None = None,
+) -> bool:
+    """A hit counts as relevant if EITHER:
+
+    - its title/body contains any required keyword token (case-insensitive
+      substring match), OR
+    - its id appears in must_match_ids — used when relevance labels come
+      from real thumbs_up events, not hand-picked keywords.
+
+    Either condition is sufficient so feedback-derived labels compose
+    naturally with keyword-derived ones.
+    """
+    if must_match_ids and result.get("id") in set(must_match_ids):
+        return True
     if not must_match_any:
         return False
     haystack = (
@@ -30,8 +44,12 @@ def is_relevant(result: dict, must_match_any: list[str]) -> bool:
     return any(tok.lower() in haystack for tok in must_match_any)
 
 
-def score_one(results: list[dict], must_match_any: list[str]) -> QueryMetrics:
-    flags = [is_relevant(r, must_match_any) for r in results]
+def score_one(
+    results: list[dict],
+    must_match_any: list[str],
+    must_match_ids: list[int] | None = None,
+) -> QueryMetrics:
+    flags = [is_relevant(r, must_match_any, must_match_ids) for r in results]
     n_relevant = sum(flags)
     first_rel = next((i + 1 for i, f in enumerate(flags) if f), None)
     return QueryMetrics(

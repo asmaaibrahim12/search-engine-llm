@@ -117,3 +117,86 @@ async def test_search_logs_result_ids_in_metadata(app_client):
         assert all(isinstance(i, int) for i in meta["result_ids"])
     finally:
         await pool.close()
+
+
+# -----------------------------------------------------------------------------
+# Admin endpoints
+# -----------------------------------------------------------------------------
+
+
+async def test_admin_refresh_disabled_when_token_unset(app_client, monkeypatch):
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    r = await app_client.post("/admin/refresh_ctr")
+    assert r.status_code == 503
+
+
+async def test_admin_refresh_requires_token_header(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post("/admin/refresh_ctr")
+    assert r.status_code == 403
+
+
+async def test_admin_refresh_wrong_token_forbidden(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post(
+        "/admin/refresh_ctr", headers={"X-Admin-Token": "nope"}
+    )
+    assert r.status_code == 403
+
+
+async def test_admin_refresh_ok_with_token(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post(
+        "/admin/refresh_ctr", headers={"X-Admin-Token": "s3cret"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert isinstance(body["ms"], int) and body["ms"] >= 0
+
+
+async def test_admin_stats_returns_not_found_for_unseen_id(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+            await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+    finally:
+        await pool.close()
+
+    r = await app_client.get(
+        "/admin/stats/999999", headers={"X-Admin-Token": "s3cret"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"result_id": 999999, "found": False}
+
+
+async def test_admin_stats_returns_row_after_events(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+            # Seed three clicks on result_id=1.
+            for _ in range(3):
+                await conn.execute(
+                    "INSERT INTO search_events (session_id, query, event_type, "
+                    "result_id) VALUES ('s', 'q', 'click', 1)",
+                )
+            await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+    finally:
+        await pool.close()
+
+    r = await app_client.get(
+        "/admin/stats/1", headers={"X-Admin-Token": "s3cret"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["found"] is True
+    assert body["result_id"] == 1
+    assert body["clicks"] == 3
+    assert body["impressions"] == 0
+    # ctr_shrunk uses max(impressions, 20) as denominator: 3 / 20 = 0.15
+    assert abs(body["ctr_shrunk"] - 0.15) < 1e-9

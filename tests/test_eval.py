@@ -51,6 +51,23 @@ def test_is_relevant_empty_must_match_returns_false():
     assert not is_relevant(r, [])
 
 
+def test_is_relevant_matches_must_match_ids():
+    r = {"id": 42, "title": "something totally off-topic", "body": "nope"}
+    assert is_relevant(r, [], must_match_ids=[42])
+
+
+def test_is_relevant_must_match_ids_overrides_keyword_miss():
+    """Feedback-derived label wins even when keyword judge would reject."""
+    r = {"id": 7, "title": "no keywords here", "body": ""}
+    assert is_relevant(r, ["boot"], must_match_ids=[7])
+
+
+def test_is_relevant_id_not_in_set_falls_back_to_keywords():
+    r = {"id": 3, "title": "boots guide", "body": ""}
+    assert is_relevant(r, ["boot"], must_match_ids=[99])
+    assert not is_relevant(r, ["hammer"], must_match_ids=[99])
+
+
 # -----------------------------------------------------------------------------
 # score_one — single-query metric builder
 # -----------------------------------------------------------------------------

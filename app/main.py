@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks, FastAPI, Form, HTTPException, Query, Request, Response,
 )
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
@@ -369,6 +370,82 @@ async def log_thumb(
         pipeline="hybrid_rerank",
     )
     return ""
+
+
+# -----------------------------------------------------------------------------
+# Admin endpoints — shared-secret auth, opt-in via ADMIN_TOKEN env var
+# -----------------------------------------------------------------------------
+#
+# Deliberately not behind /api or mounted under a separate app — the scope
+# is small (refresh the CTR MV, inspect per-result stats) and these paths
+# don't contribute to user latency. When ADMIN_TOKEN is unset the endpoints
+# 503 so a misconfigured deploy can't leak the data.
+
+
+def _require_admin(request: Request) -> None:
+    token = os.environ.get("ADMIN_TOKEN")
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="admin endpoints disabled; set ADMIN_TOKEN to enable.",
+        )
+    provided = request.headers.get("X-Admin-Token", "")
+    if not secrets.compare_digest(provided, token):
+        raise HTTPException(status_code=403, detail="bad or missing X-Admin-Token")
+
+
+@app.post("/admin/refresh_ctr")
+async def admin_refresh_ctr(request: Request) -> JSONResponse:
+    """Force a synchronous refresh of the result_ctr MV.
+
+    Useful after a backfill, or to pick up new events before the periodic
+    loop's next tick. Safe to call repeatedly — REFRESH CONCURRENTLY takes
+    a light lock and the fallback non-concurrent path runs at most once,
+    at first-ever refresh.
+    """
+    _require_admin(request)
+    t0 = time.perf_counter()
+    await refresh_result_ctr(request.app.state.pool)
+    return JSONResponse({
+        "status": "ok",
+        "ms": int((time.perf_counter() - t0) * 1000),
+    })
+
+
+@app.get("/admin/stats/{result_id}")
+async def admin_stats(request: Request, result_id: int) -> JSONResponse:
+    """Inspect the CTR MV row for one result_id.
+
+    Returns impressions, clicks, thumbs, and derived CTR (with the same
+    shrinkage denominator the ranker uses, so the number shown here is
+    the exact value feeding the bump). `found: false` for results that
+    have no events yet.
+    """
+    _require_admin(request)
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT result_id, impressions, clicks, thumbs_up, thumbs_down "
+            "FROM result_ctr WHERE result_id = $1",
+            result_id,
+        )
+    if row is None:
+        return JSONResponse({"result_id": result_id, "found": False})
+    clicks = int(row["clicks"])
+    impressions = int(row["impressions"])
+    thumbs_up = int(row["thumbs_up"])
+    thumbs_down = int(row["thumbs_down"])
+    # Match the ranker's shrinkage floor of 20 impressions.
+    denom = max(impressions, 20)
+    return JSONResponse({
+        "result_id": int(row["result_id"]),
+        "found": True,
+        "impressions": impressions,
+        "clicks": clicks,
+        "thumbs_up": thumbs_up,
+        "thumbs_down": thumbs_down,
+        "ctr_shrunk": round(clicks / denom, 6),
+    })
 
 
 if __name__ == "__main__":
