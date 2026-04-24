@@ -587,6 +587,39 @@ async def test_result_ctr_clicks_and_thumbs_both_count_for_same_session(pool):
     assert row["thumbs_up"] == 1
 
 
+async def test_hybrid_search_surfaces_engagement_counts(pool):
+    """The UI reads clicks/thumbs off each result dict — hybrid_search must
+    include them so the template can render the engagement chips without
+    a second round-trip."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 70, "title": "popular hiking trails in colorado"}])
+    # Three distinct-session clicks + two thumbs_up + one thumbs_down.
+    for i in range(3):
+        await _insert_event(pool, result_id=70, event_type="click",
+                             session_id=f"c{i}")
+    for i in range(2):
+        await _insert_event(pool, result_id=70, event_type="thumb_up",
+                             session_id=f"u{i}")
+    await _insert_event(pool, result_id=70, event_type="thumb_down",
+                         session_id="d0")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("colorado hiking")
+    results = await search.hybrid_search(
+        pool, "colorado hiking", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r["clicks"] == 3
+    assert r["thumbs_up"] == 2
+    assert r["thumbs_down"] == 1
+    assert "impressions" in r
+
+
 async def test_hybrid_search_empty_ctr_is_noop(pool):
     """With no events logged, ranking should match the pre-feedback behavior:
     RRF score bounded by 2/61 when a doc is rank 1 in both halves."""

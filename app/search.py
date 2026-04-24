@@ -28,7 +28,7 @@ LIMIT $2
 
 
 def _row_to_dict(row) -> dict[str, Any]:
-    return {
+    d = {
         "id": row["id"],
         "title": row["title"],
         "body": row["body"],
@@ -39,6 +39,15 @@ def _row_to_dict(row) -> dict[str, Any]:
         "tags": list(row["tags"] or []),
         "upvotes": int(row["upvotes"] or 0),
     }
+    # Engagement fields are only present when the query JOINs result_ctr.
+    # Copy them in when available so the UI can surface them without a
+    # second round-trip.
+    for key in ("clicks", "thumbs_up", "thumbs_down", "impressions"):
+        try:
+            d[key] = int(row[key] or 0)
+        except (KeyError, IndexError):
+            pass
+    return d
 
 
 async def search_by_vector(
@@ -119,7 +128,11 @@ SELECT o.id,
            )
        ) AS score,
        v.rnk AS vector_rank,
-       k.rnk AS keyword_rank
+       k.rnk AS keyword_rank,
+       COALESCE(f.clicks, 0)      AS clicks,
+       COALESCE(f.thumbs_up, 0)   AS thumbs_up,
+       COALESCE(f.thumbs_down, 0) AS thumbs_down,
+       COALESCE(f.impressions, 0) AS impressions
 FROM outdoors o
 LEFT JOIN vector_hits  v ON v.id = o.id
 LEFT JOIN keyword_hits k ON k.id = o.id
@@ -178,7 +191,11 @@ SELECT o.id,
            )
        ) AS score,
        v.rnk AS vector_rank,
-       k.rnk AS keyword_rank
+       k.rnk AS keyword_rank,
+       COALESCE(f.clicks, 0)      AS clicks,
+       COALESCE(f.thumbs_up, 0)   AS thumbs_up,
+       COALESCE(f.thumbs_down, 0) AS thumbs_down,
+       COALESCE(f.impressions, 0) AS impressions
 FROM outdoors o
 LEFT JOIN vector_hits  v ON v.id = o.id
 LEFT JOIN keyword_hits k ON k.id = o.id

@@ -57,6 +57,15 @@
               {% if r.upvotes is defined and r.upvotes > 0 %}
                 <span class="badge badge-muted" title="Upvotes">▲ {{ r.upvotes }}</span>
               {% endif %}
+              {% if r.clicks is defined and r.clicks > 0 %}
+                <span class="badge badge-muted" title="Clicks from real users">👆 {{ r.clicks }}</span>
+              {% endif %}
+              {% if r.thumbs_up is defined and r.thumbs_up > 0 %}
+                <span class="badge badge-muted" title="Thumbs up from users">👍 {{ r.thumbs_up }}</span>
+              {% endif %}
+              {% if r.thumbs_down is defined and r.thumbs_down > 0 %}
+                <span class="badge badge-muted" title="Thumbs down from users">👎 {{ r.thumbs_down }}</span>
+              {% endif %}
               <span class="title">{{ r.title if r.title else (r.body | strip_html | truncate(80)) }}</span>
             </div>
             {% if r.body and r.title %}
