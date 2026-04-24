@@ -80,6 +80,33 @@ async def test_summary_streams_sse(app_client, fake_claude):
     assert "data: lo" in text
 
 
+async def test_summary_degrades_gracefully_on_upstream_error(app_client, monkeypatch):
+    """A 400/429/5xx from Anthropic must not crash the SSE task group.
+    The client should receive a visible fallback token + a stage=error
+    record, not a backtrace on the server."""
+    from app import rag
+
+    async def _boom(prompt):
+        # Simulate e.g. anthropic.BadRequestError on credit exhaustion.
+        raise RuntimeError("simulated upstream failure")
+        yield  # pragma: no cover — unreachable, keeps this an async gen
+
+    monkeypatch.setattr(rag, "stream_summary", _boom)
+
+    async with app_client.stream("GET", "/summary", params={"query": "shoes"}) as r:
+        assert r.status_code == 200
+        body = b""
+        async for chunk in r.aiter_bytes():
+            body += chunk
+    text = body.decode()
+    assert "Summary unavailable" in text
+    # Stage record for the LLM stage flipped to error with the class name.
+    assert '"status": "error"' in text
+    assert "RuntimeError" in text
+    # Stream still closes cleanly with the done event.
+    assert "event: done" in text
+
+
 async def test_prompt_injection_still_runs_search(app_client, fake_claude):
     # Even when the user tries to override instructions, search must return
     # real results; the LLM behavior itself is mocked here.

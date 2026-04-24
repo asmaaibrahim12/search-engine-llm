@@ -302,12 +302,37 @@ async def summary_endpoint(
         token_count = 0
         first_token_ms: int | None = None
         char_count = 0
-        async for chunk in rag.stream_summary(prompt):
-            if first_token_ms is None:
-                first_token_ms = int((time.perf_counter() - t0) * 1000)
-            token_count += 1
-            char_count += len(chunk)
-            yield {"event": "token", "data": chunk}
+        try:
+            async for chunk in rag.stream_summary(prompt):
+                if first_token_ms is None:
+                    first_token_ms = int((time.perf_counter() - t0) * 1000)
+                token_count += 1
+                char_count += len(chunk)
+                yield {"event": "token", "data": chunk}
+        except Exception as exc:
+            # Upstream LLM failure (billing / rate-limit / network) must
+            # not crash the SSE task group. Log the real error server-side
+            # and fall back to a user-visible message so the summary box
+            # stays readable and retrieval results (already rendered) are
+            # unaffected.
+            from app.logging_setup import get_logger
+            get_logger().warning(
+                "summary stream failed",
+                extra={"model": rag.MODEL, "err": repr(exc)},
+            )
+            fallback = (
+                "Summary unavailable — the model provider returned an "
+                "error. Retrieval results above are unaffected."
+            )
+            yield {"event": "token", "data": fallback}
+            yield _stage(
+                "llm",
+                "error",
+                model=rag.MODEL,
+                err_class=type(exc).__name__,
+            )
+            yield {"event": "done", "data": ""}
+            return
 
         total_ms = int((time.perf_counter() - t_start) * 1000)
         yield _stage(
