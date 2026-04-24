@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,12 +13,15 @@ from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks, FastAPI, Form, HTTPException, Query, Request, Response,
 )
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
 from app import embeddings, events, rag, rerank, search
-from app.db import create_pool, ensure_schema
+from app.db import (
+    create_pool, ensure_schema, refresh_result_ctr, result_ctr_refresh_loop,
+)
+from app.logging_setup import configure as configure_logging
 from app.text import strip_html
 
 load_dotenv()
@@ -53,6 +58,9 @@ PROMPT_TOP_K = 5   # top results passed into the LLM prompt
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure structured logging before anything else so the rest of
+    # startup (pool bootstrap, MV refresh) emits structured records.
+    configure_logging()
     # Warm both models so the first request doesn't pay the load cost.
     embeddings.get_model()
     rerank.get_reranker()
@@ -64,9 +72,33 @@ async def lifespan(app: FastAPI):
         app.state.top_tags = await search.top_tags(app.state.pool, limit=30)
     except Exception:
         app.state.top_tags = []
+    # Build result_ctr once at boot (ensure_schema above drops+recreates
+    # the MV empty) and then keep it fresh on a timer. Interval is tunable
+    # via env; the default is a gentle 5 minutes. Set to 0 to disable.
+    await refresh_result_ctr(app.state.pool)
+    refresh_interval_s = int(os.environ.get("RESULT_CTR_REFRESH_SEC", "300"))
+    refresh_task: asyncio.Task | None = None
+    if refresh_interval_s > 0:
+        refresh_task = asyncio.create_task(
+            result_ctr_refresh_loop(app.state.pool, refresh_interval_s)
+        )
     try:
         yield
     finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                # Don't block shutdown on a refresh-loop bug, but surface
+                # it — silently swallowing here has hidden real issues.
+                from app.logging_setup import get_logger
+                get_logger().warning(
+                    "refresh loop failed during shutdown",
+                    extra={"err": repr(exc)},
+                )
         await app.state.pool.close()
 
 
@@ -142,6 +174,10 @@ async def search_endpoint(
             "item_types": item_types or [],
             "accepted_only": bool(accepted_only),
             "n_results": len(results),
+            # Impression set: needed so click/thumb events can be
+            # joined back to what the user actually saw, and so CTR
+            # can be computed offline (or feed result_ctr MV).
+            "result_ids": [r["id"] for r in results],
         },
     )
     # Build the SSE URL for /summary with the same filters so the streamed
@@ -293,8 +329,8 @@ async def summary_endpoint(
 # -----------------------------------------------------------------------------
 
 
-def _assert_rate_limit(session_id: str) -> None:
-    if not events.rate_limit_ok(session_id):
+async def _assert_rate_limit(pool, session_id: str) -> None:
+    if not await events.rate_limit_ok(pool, session_id):
         raise HTTPException(
             status_code=429,
             detail="Too many events from this session; try again in a minute.",
@@ -311,7 +347,7 @@ async def log_click(
     position: int = Form(...),
 ) -> str:
     session_id = events.get_or_create_session(request, response)
-    _assert_rate_limit(session_id)
+    await _assert_rate_limit(request.app.state.pool, session_id)
     background.add_task(
         events.log_event,
         request.app.state.pool,
@@ -336,7 +372,7 @@ async def log_thumb(
     if vote not in ("up", "down"):
         raise HTTPException(status_code=400, detail="vote must be 'up' or 'down'")
     session_id = events.get_or_create_session(request, response)
-    _assert_rate_limit(session_id)
+    await _assert_rate_limit(request.app.state.pool, session_id)
     background.add_task(
         events.log_event,
         request.app.state.pool,
@@ -346,6 +382,216 @@ async def log_thumb(
         pipeline="hybrid_rerank",
     )
     return ""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request) -> HTMLResponse:
+    """Static HTML shell for the admin dashboard. Not token-gated on its
+    own — all the data it shows goes through token-gated API calls, so
+    the page itself leaks nothing beyond its existence."""
+    return templates.TemplateResponse(request, "admin.html", {})
+
+
+# -----------------------------------------------------------------------------
+# Admin endpoints — shared-secret auth, opt-in via ADMIN_TOKEN env var
+# -----------------------------------------------------------------------------
+#
+# Deliberately not behind /api or mounted under a separate app — the scope
+# is small (refresh the CTR MV, inspect per-result stats) and these paths
+# don't contribute to user latency. When ADMIN_TOKEN is unset the endpoints
+# 503 so a misconfigured deploy can't leak the data.
+
+
+def _require_admin(request: Request) -> None:
+    token = os.environ.get("ADMIN_TOKEN")
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="admin endpoints disabled; set ADMIN_TOKEN to enable.",
+        )
+    provided = request.headers.get("X-Admin-Token", "")
+    if not secrets.compare_digest(provided, token):
+        raise HTTPException(status_code=403, detail="bad or missing X-Admin-Token")
+
+
+@app.post("/admin/refresh_ctr")
+async def admin_refresh_ctr(request: Request) -> JSONResponse:
+    """Force a synchronous refresh of the result_ctr MV.
+
+    Useful after a backfill, or to pick up new events before the periodic
+    loop's next tick. Safe to call repeatedly — REFRESH CONCURRENTLY takes
+    a light lock and the fallback non-concurrent path runs at most once,
+    at first-ever refresh.
+    """
+    _require_admin(request)
+    t0 = time.perf_counter()
+    await refresh_result_ctr(request.app.state.pool)
+    return JSONResponse({
+        "status": "ok",
+        "ms": int((time.perf_counter() - t0) * 1000),
+    })
+
+
+@app.get("/admin/metrics")
+async def admin_metrics(request: Request) -> JSONResponse:
+    """Feedback-loop health at a glance.
+
+    Returns:
+      - event_counts: total + last-24h count per event_type
+      - ctr_rows: how many result_ids the MV has coverage for
+      - recent_search_latency_ms: mean + p95 over the last 24h of
+        'search' events (only rows where latency_ms is non-null)
+    Cheap enough for a dashboard ping every few seconds; both queries hit
+    the existing search_events indexes.
+    """
+    _require_admin(request)
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        event_rows = await conn.fetch(
+            """
+            SELECT event_type,
+                   COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '24 hours')
+                       AS last_24h,
+                   COUNT(*) AS total
+            FROM search_events
+            GROUP BY event_type
+            ORDER BY event_type
+            """
+        )
+        ctr_rows = await conn.fetchval("SELECT COUNT(*) FROM result_ctr")
+        latency = await conn.fetchrow(
+            """
+            SELECT AVG(latency_ms)::int AS mean_ms,
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::int
+                       AS p95_ms,
+                   COUNT(*) AS n
+            FROM search_events
+            WHERE event_type = 'search'
+              AND latency_ms IS NOT NULL
+              AND occurred_at >= NOW() - INTERVAL '24 hours'
+            """
+        )
+    return JSONResponse({
+        "event_counts": [
+            {
+                "event_type": r["event_type"],
+                "last_24h": int(r["last_24h"]),
+                "total": int(r["total"]),
+            }
+            for r in event_rows
+        ],
+        "ctr_rows": int(ctr_rows or 0),
+        "recent_search_latency_ms": {
+            "n": int(latency["n"] or 0),
+            "mean": int(latency["mean_ms"] or 0) if latency["n"] else None,
+            "p95":  int(latency["p95_ms"]  or 0) if latency["n"] else None,
+        },
+    })
+
+
+@app.get("/admin/queries")
+async def admin_top_queries(
+    request: Request,
+    since_hours: int = Query(24, ge=1, le=24 * 30),
+    limit: int = Query(50, ge=1, le=500),
+) -> JSONResponse:
+    """Top queries by volume over the last `since_hours` hours.
+
+    Handy for content ops: which queries drive traffic, how many clicks
+    vs. thumbs they earn, median latency. The aggregate is keyed on a
+    normalized (lowercased, trimmed) query string so minor capitalization
+    differences collapse together.
+    """
+    _require_admin(request)
+    sql = """
+    WITH window AS (
+        SELECT *
+        FROM search_events
+        WHERE occurred_at >= NOW() - ($1 || ' hours')::interval
+    ),
+    searches AS (
+        SELECT lower(trim(query)) AS q,
+               COUNT(*)           AS searches,
+               AVG(latency_ms)::int AS mean_latency_ms
+        FROM window
+        WHERE event_type = 'search'
+        GROUP BY 1
+    ),
+    engagements AS (
+        SELECT lower(trim(query)) AS q,
+               COUNT(*) FILTER (WHERE event_type = 'click')       AS clicks,
+               COUNT(*) FILTER (WHERE event_type = 'thumb_up')    AS thumbs_up,
+               COUNT(*) FILTER (WHERE event_type = 'thumb_down')  AS thumbs_down
+        FROM window
+        WHERE event_type IN ('click', 'thumb_up', 'thumb_down')
+        GROUP BY 1
+    )
+    SELECT COALESCE(s.q, e.q) AS query_norm,
+           COALESCE(s.searches, 0)           AS searches,
+           COALESCE(e.clicks, 0)             AS clicks,
+           COALESCE(e.thumbs_up, 0)          AS thumbs_up,
+           COALESCE(e.thumbs_down, 0)        AS thumbs_down,
+           s.mean_latency_ms                 AS mean_latency_ms
+    FROM searches s
+    FULL OUTER JOIN engagements e ON e.q = s.q
+    WHERE COALESCE(s.q, e.q) IS NOT NULL AND COALESCE(s.q, e.q) <> ''
+    ORDER BY COALESCE(s.searches, 0) DESC, COALESCE(e.clicks, 0) DESC
+    LIMIT $2
+    """
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(sql, str(since_hours), limit)
+    return JSONResponse({
+        "since_hours": since_hours,
+        "queries": [
+            {
+                "query": r["query_norm"],
+                "searches": int(r["searches"]),
+                "clicks": int(r["clicks"]),
+                "thumbs_up": int(r["thumbs_up"]),
+                "thumbs_down": int(r["thumbs_down"]),
+                "mean_latency_ms": (
+                    int(r["mean_latency_ms"]) if r["mean_latency_ms"] is not None else None
+                ),
+            }
+            for r in rows
+        ],
+    })
+
+
+@app.get("/admin/stats/{result_id}")
+async def admin_stats(request: Request, result_id: int) -> JSONResponse:
+    """Inspect the CTR MV row for one result_id.
+
+    Returns impressions, clicks, thumbs, and derived CTR (with the same
+    shrinkage denominator the ranker uses, so the number shown here is
+    the exact value feeding the bump). `found: false` for results that
+    have no events yet.
+    """
+    _require_admin(request)
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT result_id, impressions, clicks, thumbs_up, thumbs_down "
+            "FROM result_ctr WHERE result_id = $1",
+            result_id,
+        )
+    if row is None:
+        return JSONResponse({"result_id": result_id, "found": False})
+    clicks = int(row["clicks"])
+    impressions = int(row["impressions"])
+    thumbs_up = int(row["thumbs_up"])
+    thumbs_down = int(row["thumbs_down"])
+    # Match the ranker's shrinkage floor of 20 impressions.
+    denom = max(impressions, 20)
+    return JSONResponse({
+        "result_id": int(row["result_id"]),
+        "found": True,
+        "impressions": impressions,
+        "clicks": clicks,
+        "thumbs_up": thumbs_up,
+        "thumbs_down": thumbs_down,
+        "ctr_shrunk": round(clicks / denom, 6),
+    })
 
 
 if __name__ == "__main__":

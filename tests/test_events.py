@@ -6,7 +6,6 @@ DB-backed tests cover log_event actually writing rows into search_events.
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 from starlette.requests import Request
@@ -67,46 +66,21 @@ def test_session_is_reminted_when_cookie_wrong_length():
     assert events._is_uuid(sid)
 
 
-def test_rate_limit_allows_up_to_quota():
-    events._buckets.clear()
-    sid = "test-session-allow"
-    for i in range(events.RATE_LIMIT_PER_WINDOW):
-        assert events.rate_limit_ok(sid), f"failed at event #{i}"
+def test_cookie_secure_defaults_to_false(monkeypatch):
+    """Local dev (HTTP) must NOT set Secure or browsers drop the cookie."""
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+    req = _make_request()
+    resp = Response()
+    events.get_or_create_session(req, resp)
+    assert "secure" not in resp.headers["set-cookie"].lower()
 
 
-def test_rate_limit_blocks_over_quota():
-    events._buckets.clear()
-    sid = "test-session-block"
-    for _ in range(events.RATE_LIMIT_PER_WINDOW):
-        events.rate_limit_ok(sid)
-    # One more should trip the limit
-    assert not events.rate_limit_ok(sid)
-
-
-def test_rate_limit_is_per_session():
-    events._buckets.clear()
-    sid_a, sid_b = "session-a", "session-b"
-    for _ in range(events.RATE_LIMIT_PER_WINDOW):
-        events.rate_limit_ok(sid_a)
-    # A is saturated, B is fresh
-    assert not events.rate_limit_ok(sid_a)
-    assert events.rate_limit_ok(sid_b)
-
-
-def test_rate_limit_window_expires(monkeypatch):
-    events._buckets.clear()
-    sid = "expiring-session"
-
-    t = {"now": 1000.0}
-    monkeypatch.setattr(time, "monotonic", lambda: t["now"])
-
-    for _ in range(events.RATE_LIMIT_PER_WINDOW):
-        events.rate_limit_ok(sid)
-    assert not events.rate_limit_ok(sid)
-
-    # Jump forward past the window; bucket should drain
-    t["now"] += events.RATE_LIMIT_WINDOW_S + 1
-    assert events.rate_limit_ok(sid)
+def test_cookie_secure_set_when_env_enabled(monkeypatch):
+    monkeypatch.setenv("COOKIE_SECURE", "1")
+    req = _make_request()
+    resp = Response()
+    events.get_or_create_session(req, resp)
+    assert "secure" in resp.headers["set-cookie"].lower()
 
 
 def test_is_uuid_truthy_and_falsy():
@@ -220,3 +194,101 @@ async def test_search_events_rejects_invalid_event_type(pool):
                 "INSERT INTO search_events (session_id, query, event_type) "
                 "VALUES ('s', 'q', 'bogus')"
             )
+
+
+# -----------------------------------------------------------------------------
+# DB-backed rate limiter
+# -----------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def rl_pool():
+    p = await create_pool(TEST_DATABASE_URL)
+    await ensure_schema(p)
+    async with p.acquire() as conn:
+        await conn.execute("TRUNCATE rate_limit_buckets")
+    yield p
+    await p.close()
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_rate_limit_allows_up_to_quota(rl_pool):
+    sid = "rl-allow"
+    for i in range(events.RATE_LIMIT_PER_WINDOW):
+        ok = await events.rate_limit_ok(rl_pool, sid)
+        assert ok, f"failed at event #{i}"
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_rate_limit_blocks_over_quota(rl_pool):
+    sid = "rl-block"
+    for _ in range(events.RATE_LIMIT_PER_WINDOW):
+        await events.rate_limit_ok(rl_pool, sid)
+    assert not await events.rate_limit_ok(rl_pool, sid)
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_rate_limit_is_per_session(rl_pool):
+    sid_a, sid_b = "rl-a", "rl-b"
+    for _ in range(events.RATE_LIMIT_PER_WINDOW):
+        await events.rate_limit_ok(rl_pool, sid_a)
+    assert not await events.rate_limit_ok(rl_pool, sid_a)
+    assert await events.rate_limit_ok(rl_pool, sid_b)
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_rate_limit_window_resets_after_expiry(rl_pool):
+    """Backdate the window_start so the CASE WHEN reset branch fires."""
+    sid = "rl-expire"
+    # Prime at the quota.
+    async with rl_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO rate_limit_buckets (session_id, window_start, count) "
+            "VALUES ($1, NOW() - INTERVAL '5 minutes', $2)",
+            sid, events.RATE_LIMIT_PER_WINDOW,
+        )
+    # Fresh call after window expiry resets: count becomes 1 → allowed.
+    assert await events.rate_limit_ok(rl_pool, sid)
+    async with rl_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count FROM rate_limit_buckets WHERE session_id = $1", sid
+        )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_rate_limit_fails_open_on_db_error(rl_pool):
+    """A DB outage must not drop user events — we prefer slight over-count."""
+    await rl_pool.close()
+    ok = await events.rate_limit_ok(rl_pool, "anything")
+    assert ok is True
+
+
+@pytest.mark.asyncio
+@needs_db
+async def test_prune_rate_limit_buckets_drops_old_rows():
+    from app.db import prune_rate_limit_buckets
+    p = await create_pool(TEST_DATABASE_URL)
+    try:
+        await ensure_schema(p)
+        async with p.acquire() as conn:
+            await conn.execute("TRUNCATE rate_limit_buckets")
+            await conn.execute(
+                "INSERT INTO rate_limit_buckets (session_id, window_start, count) "
+                "VALUES ('old', NOW() - INTERVAL '2 days', 5), "
+                "       ('new', NOW(), 5)"
+            )
+        deleted = await prune_rate_limit_buckets(p, older_than_s=86400)
+        assert deleted == 1
+        async with p.acquire() as conn:
+            remaining = await conn.fetch(
+                "SELECT session_id FROM rate_limit_buckets ORDER BY session_id"
+            )
+        assert [r["session_id"] for r in remaining] == ["new"]
+    finally:
+        await p.close()

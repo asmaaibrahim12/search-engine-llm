@@ -378,3 +378,294 @@ async def test_top_tags_empty_db(pool):
         await conn.execute("TRUNCATE outdoors")
     tags = await search.top_tags(pool)
     assert tags == []
+
+
+# -----------------------------------------------------------------------------
+# result_ctr feedback-loop bump
+# -----------------------------------------------------------------------------
+
+
+async def _insert_event(
+    pool,
+    *,
+    result_id: int,
+    event_type: str,
+    session_id: str = "t",
+    query: str = "q",
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO search_events (session_id, query, event_type, result_id) "
+            "VALUES ($1, $2, $3, $4)",
+            session_id, query, event_type, result_id,
+        )
+
+
+async def _refresh_ctr(pool) -> None:
+    from app.db import refresh_result_ctr
+    await refresh_result_ctr(pool)
+
+
+async def test_hybrid_search_click_bump_breaks_ties(pool):
+    """Two near-identical answers; one has prior clicks. Clicked one wins."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 1, "title": "How to lace hiking boots"},
+    ])
+    bodies = ["Use a surgeon's knot at the ankle hooks.",
+              "Use a surgeon's knot at the ankle hooks."]
+    vecs = embed_batch(bodies)
+    records = [
+        (10, 1, "answer", None, bodies[0], 5, False, [], np.array(vecs[0], dtype=np.float32)),
+        (11, 1, "answer", None, bodies[1], 5, False, [], np.array(vecs[1], dtype=np.float32)),
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO outdoors (id, parent_id, item_type, title, body, "
+            "score, is_accepted, tags, content_embedding) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            records,
+        )
+    # Log clicks on id=11 from 5 distinct sessions; none on id=10.
+    # Distinct sessions are necessary because the MV dedupes repeat
+    # clicks from the same session into one.
+    for i in range(5):
+        await _insert_event(pool, result_id=11, event_type="click",
+                             session_id=f"s{i}")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("lace hiking boots")
+    results = await search.hybrid_search(
+        pool, "lace hiking boots", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[11] < positions[10], (
+        f"clicked answer should rank above unclicked on ties, got {results}"
+    )
+
+
+async def test_hybrid_search_thumb_down_demotes(pool):
+    """Two near-identical rows; one gets thumbs_down. The clean one wins."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 20, "title": "best rain jacket for spring hikes"},
+        {"id": 21, "title": "best rain jacket for spring hikes"},
+    ])
+    # Distinct sessions so dedup doesn't collapse them to one thumb_down.
+    for i in range(4):
+        await _insert_event(pool, result_id=20, event_type="thumb_down",
+                             session_id=f"d{i}")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("rain jacket spring")
+    results = await search.hybrid_search(
+        pool, "rain jacket spring", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[21] < positions[20], (
+        f"thumb_down'd row should rank below the clean one, got {results}"
+    )
+
+
+async def _insert_search_impression(pool, *, result_ids: list[int]) -> None:
+    import json as _json
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO search_events (session_id, query, event_type, metadata) "
+            "VALUES ('t', 'q', 'search', $1::jsonb)",
+            _json.dumps({"result_ids": result_ids}),
+        )
+
+
+async def test_hybrid_search_ctr_rate_beats_raw_clicks(pool):
+    """Two docs with identical 5 clicks each: the one shown far fewer times
+    (higher CTR) should outrank the one shown many times (low CTR). This
+    is the whole point of using impressions as a denominator, not raw
+    click counts."""
+    from app.embeddings import embed_batch, embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [
+        {"id": 30, "title": "best backpack for thru-hiking"},
+        {"id": 31, "title": "best backpack for thru-hiking"},
+    ])
+    # Both get 5 clicks from distinct sessions (one session per click, so
+    # MV dedup doesn't swallow them) — same thumb state.
+    for i in range(5):
+        await _insert_event(pool, result_id=30, event_type="click",
+                             session_id=f"a{i}")
+        await _insert_event(pool, result_id=31, event_type="click",
+                             session_id=f"b{i}")
+    # id=30 shown 10 times (CTR 0.5); id=31 shown 200 times (CTR 0.025).
+    for _ in range(10):
+        await _insert_search_impression(pool, result_ids=[30])
+    for _ in range(200):
+        await _insert_search_impression(pool, result_ids=[31])
+    await _refresh_ctr(pool)
+
+    vec = embed_query("backpack thru-hiking")
+    results = await search.hybrid_search(
+        pool, "backpack thru-hiking", vec, k_retrieve=10, k_final=10,
+    )
+    positions = {r["id"]: i for i, r in enumerate(results)}
+    assert positions[30] < positions[31], (
+        f"higher-CTR doc (5/10) should outrank lower-CTR doc (5/200), "
+        f"got {results}"
+    )
+
+
+async def test_result_ctr_dedupes_same_session_clicks(pool):
+    """Many clicks on the same result by the same session should count as one
+    in the MV, so one hyperactive tab can't inflate the click bump."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    # 10 clicks from one session on result 40 + 1 click from a different
+    # session on the same result.
+    for _ in range(10):
+        await _insert_event(pool, result_id=40, event_type="click",
+                             session_id="hyper", query="same")
+    await _insert_event(pool, result_id=40, event_type="click",
+                         session_id="other", query="same")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT clicks FROM result_ctr WHERE result_id = 40"
+        )
+    assert row is not None
+    # 2 distinct (session, query) keys → 2 clicks, not 11.
+    assert row["clicks"] == 2
+
+
+async def test_result_ctr_thumb_toggle_keeps_only_latest(pool):
+    """thumb_up → thumb_down should count as 1 thumb_down, not 1 of each."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _insert_event(pool, result_id=50, event_type="thumb_up",
+                         session_id="flip", query="same")
+    # Ensure a strictly-later occurred_at so DISTINCT ON picks the down vote.
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.01)
+    await _insert_event(pool, result_id=50, event_type="thumb_down",
+                         session_id="flip", query="same")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT thumbs_up, thumbs_down FROM result_ctr WHERE result_id = 50"
+        )
+    assert row["thumbs_up"] == 0
+    assert row["thumbs_down"] == 1
+
+
+async def test_result_ctr_clicks_and_thumbs_both_count_for_same_session(pool):
+    """Dedup partitions clicks and thumbs separately — a user who both clicks
+    AND thumbs-up the same result should contribute one of each."""
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _insert_event(pool, result_id=60, event_type="click",
+                         session_id="s", query="q")
+    await _insert_event(pool, result_id=60, event_type="thumb_up",
+                         session_id="s", query="q")
+    await _refresh_ctr(pool)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT clicks, thumbs_up FROM result_ctr WHERE result_id = 60"
+        )
+    assert row["clicks"] == 1
+    assert row["thumbs_up"] == 1
+
+
+async def test_hybrid_search_surfaces_engagement_counts(pool):
+    """The UI reads clicks/thumbs off each result dict — hybrid_search must
+    include them so the template can render the engagement chips without
+    a second round-trip."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 70, "title": "popular hiking trails in colorado"}])
+    # Three distinct-session clicks + two thumbs_up + one thumbs_down.
+    for i in range(3):
+        await _insert_event(pool, result_id=70, event_type="click",
+                             session_id=f"c{i}")
+    for i in range(2):
+        await _insert_event(pool, result_id=70, event_type="thumb_up",
+                             session_id=f"u{i}")
+    await _insert_event(pool, result_id=70, event_type="thumb_down",
+                         session_id="d0")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("colorado hiking")
+    results = await search.hybrid_search(
+        pool, "colorado hiking", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r["clicks"] == 3
+    assert r["thumbs_up"] == 2
+    assert r["thumbs_down"] == 1
+    assert "impressions" in r
+
+
+async def test_hybrid_search_clamps_orphan_clicks(pool):
+    """Orphan clicks (clicks > impressions, e.g. legacy data pre-dating
+    the result_ids metadata) must not push the bump past its documented
+    ceiling of +0.010 — otherwise the feedback signal overwhelms RRF."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 80, "title": "avalanche safety for backcountry skiers"}])
+    # 200 distinct sessions click the same result; no search events (so
+    # impressions = 0 in the MV). Without the LEAST(..., 1.0) clamp the
+    # bump would be 0.010 * 200/20 = +0.100, which is ~3× what one RRF
+    # rank contributes.
+    for i in range(200):
+        await _insert_event(pool, result_id=80, event_type="click",
+                             session_id=f"orphan-{i}")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("avalanche backcountry")
+    results = await search.hybrid_search(
+        pool, "avalanche backcountry", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r["clicks"] == 200
+    assert r["impressions"] == 0
+    # Max possible score with clamp: 2/61 (rank 1 in both halves) + 0.010
+    # (clamped click bump) ≈ 0.0428. Without clamp, it would be ~0.1328.
+    # Leave room for tiny numeric noise.
+    assert r["score"] <= 0.05, f"orphan clicks unbounded: score={r['score']}"
+
+
+async def test_hybrid_search_empty_ctr_is_noop(pool):
+    """With no events logged, ranking should match the pre-feedback behavior:
+    RRF score bounded by 2/61 when a doc is rank 1 in both halves."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 1, "title": "water purification tablets"}])
+    await _refresh_ctr(pool)
+    vec = embed_query("water purification")
+    results = await search.hybrid_search(
+        pool, "water purification", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    assert 0 < results[0]["score"] <= 2 / 61 + 1e-9

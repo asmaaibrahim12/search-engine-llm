@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Admin · search-app</title>
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --ink-muted: #6b6b6b;
+      --surface: #faf7f2;
+      --surface-alt: #efeae1;
+      --border: #d6ccbb;
+      --accent: #5b8a3a;
+      --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: var(--surface);
+      color: var(--ink);
+      margin: 0;
+      padding: 24px;
+    }
+    h1 { font-size: 22px; margin: 0 0 16px; }
+    h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em;
+         color: var(--ink-muted); margin: 24px 0 8px; }
+    .card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input[type=password], input[type=number], input[type=text] {
+      font-family: var(--mono);
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      font-size: 13px;
+    }
+    button {
+      padding: 6px 14px;
+      border: 1px solid var(--border);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px;
+             border-bottom: 1px solid var(--border); }
+    th { color: var(--ink-muted); font-weight: 500;
+         text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+    td.num { font-family: var(--mono); text-align: right; }
+    .hint { color: var(--ink-muted); font-size: 12px; }
+    .err { color: #b5543a; font-family: var(--mono); font-size: 12px; }
+    pre { margin: 0; font-family: var(--mono); font-size: 12px;
+          white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Admin dashboard</h1>
+  <p class="hint">All data here comes from the token-gated <code>/admin/*</code>
+  endpoints. Token is stored in this tab's <code>sessionStorage</code>;
+  refresh the page to re-enter.</p>
+
+  <div class="card">
+    <h2>Token</h2>
+    <div class="row">
+      <input id="tok" type="password" placeholder="X-Admin-Token" style="flex: 1; min-width: 200px" />
+      <button id="save-tok">Save</button>
+      <span id="tok-status" class="hint"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Feedback-loop snapshot <span class="hint">— /admin/metrics</span></h2>
+    <button id="refresh-metrics">Refresh</button>
+    <div id="metrics" style="margin-top: 12px"><span class="hint">(not loaded)</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Top queries <span class="hint">— /admin/queries</span></h2>
+    <div class="row">
+      <label class="hint">since_hours
+        <input id="queries-hours" type="number" value="24" min="1" max="720" style="width: 70px" />
+      </label>
+      <label class="hint">limit
+        <input id="queries-limit" type="number" value="25" min="1" max="500" style="width: 70px" />
+      </label>
+      <button id="refresh-queries">Refresh</button>
+    </div>
+    <div id="queries" style="margin-top: 12px"><span class="hint">(not loaded)</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Per-result stats <span class="hint">— /admin/stats/&#123;id&#125;</span></h2>
+    <div class="row">
+      <label class="hint">result_id
+        <input id="stats-id" type="number" placeholder="e.g. 12345" style="width: 140px" />
+      </label>
+      <button id="refresh-stats">Look up</button>
+    </div>
+    <div id="stats" style="margin-top: 12px"><span class="hint">(not loaded)</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Force CTR refresh <span class="hint">— POST /admin/refresh_ctr</span></h2>
+    <button id="force-refresh">Refresh result_ctr now</button>
+    <span id="refresh-status" class="hint" style="margin-left: 12px"></span>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    // Persist the token across dashboard actions but not across tabs.
+    function getToken() { return sessionStorage.getItem('admin_token') || ''; }
+    function setToken(t) { sessionStorage.setItem('admin_token', t); }
+    $('tok').value = getToken();
+    $('save-tok').onclick = () => {
+      setToken($('tok').value);
+      $('tok-status').textContent = 'saved';
+      setTimeout(() => $('tok-status').textContent = '', 1500);
+    };
+
+    async function adminFetch(path, opts = {}) {
+      const token = getToken();
+      if (!token) throw new Error('Set the admin token first');
+      const res = await fetch(path, {
+        ...opts,
+        headers: { 'X-Admin-Token': token, ...(opts.headers || {}) },
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`${res.status} ${res.statusText}: ${body}`);
+      }
+      return res.json();
+    }
+
+    function renderError(el, err) {
+      el.innerHTML = `<span class="err">${String(err.message || err)}</span>`;
+    }
+
+    // --- Metrics ---------------------------------------------------------
+    async function loadMetrics() {
+      const el = $('metrics');
+      el.innerHTML = '<span class="hint">loading…</span>';
+      try {
+        const m = await adminFetch('/admin/metrics');
+        let rows = m.event_counts.map(r =>
+          `<tr><td>${r.event_type}</td><td class="num">${r.last_24h}</td>` +
+          `<td class="num">${r.total}</td></tr>`
+        ).join('');
+        const lat = m.recent_search_latency_ms;
+        el.innerHTML =
+          `<table>
+             <tr><th>event_type</th><th>last 24h</th><th>total</th></tr>
+             ${rows}
+             <tr><td colspan="3" class="hint">` +
+              `ctr_rows: ${m.ctr_rows} · ` +
+              `search latency (24h, n=${lat.n}): ` +
+              `mean ${lat.mean ?? '–'} ms, p95 ${lat.p95 ?? '–'} ms` +
+            `</td></tr>
+           </table>`;
+      } catch (e) { renderError(el, e); }
+    }
+
+    // --- Top queries -----------------------------------------------------
+    async function loadQueries() {
+      const el = $('queries');
+      el.innerHTML = '<span class="hint">loading…</span>';
+      try {
+        const hours = $('queries-hours').value;
+        const limit = $('queries-limit').value;
+        const q = await adminFetch(`/admin/queries?since_hours=${hours}&limit=${limit}`);
+        if (!q.queries.length) {
+          el.innerHTML = '<span class="hint">(no events in window)</span>';
+          return;
+        }
+        const rows = q.queries.map(r =>
+          `<tr>
+             <td>${escapeHtml(r.query)}</td>
+             <td class="num">${r.searches}</td>
+             <td class="num">${r.clicks}</td>
+             <td class="num">${r.thumbs_up}</td>
+             <td class="num">${r.thumbs_down}</td>
+             <td class="num">${r.mean_latency_ms ?? '–'}</td>
+           </tr>`
+        ).join('');
+        el.innerHTML =
+          `<table>
+             <tr><th>query</th><th>searches</th><th>clicks</th>
+                 <th>👍</th><th>👎</th><th>ms</th></tr>
+             ${rows}
+           </table>`;
+      } catch (e) { renderError(el, e); }
+    }
+
+    // --- Per-result stats -----------------------------------------------
+    async function loadStats() {
+      const el = $('stats');
+      const id = $('stats-id').value;
+      if (!id) { el.innerHTML = '<span class="hint">enter a result_id</span>'; return; }
+      el.innerHTML = '<span class="hint">loading…</span>';
+      try {
+        const s = await adminFetch(`/admin/stats/${encodeURIComponent(id)}`);
+        if (!s.found) {
+          el.innerHTML = `<span class="hint">no events for result_id=${s.result_id}</span>`;
+          return;
+        }
+        el.innerHTML =
+          `<pre>` +
+          `impressions: ${s.impressions}\n` +
+          `clicks:      ${s.clicks}\n` +
+          `thumbs_up:   ${s.thumbs_up}\n` +
+          `thumbs_down: ${s.thumbs_down}\n` +
+          `ctr_shrunk:  ${s.ctr_shrunk}` +
+          `</pre>`;
+      } catch (e) { renderError(el, e); }
+    }
+
+    // --- Force refresh ---------------------------------------------------
+    $('force-refresh').onclick = async () => {
+      const s = $('refresh-status');
+      s.textContent = 'refreshing…';
+      try {
+        const r = await adminFetch('/admin/refresh_ctr', { method: 'POST' });
+        s.textContent = `ok in ${r.ms} ms`;
+      } catch (e) { s.textContent = String(e.message || e); }
+    };
+
+    $('refresh-metrics').onclick = loadMetrics;
+    $('refresh-queries').onclick = loadQueries;
+    $('refresh-stats').onclick = loadStats;
+
+    // Keep innerHTML-safe. Never trust server query strings; they're user-
+    // provided and flow back through /admin/queries.
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    if (getToken()) {
+      loadMetrics();
+      loadQueries();
+    }
+  </script>
+</body>
+</html>
