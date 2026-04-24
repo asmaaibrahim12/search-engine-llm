@@ -213,6 +213,60 @@ async def test_admin_metrics_returns_expected_shape(app_client, monkeypatch):
     assert body["recent_search_latency_ms"]["mean"] is not None
 
 
+async def test_admin_queries_requires_token(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.get("/admin/queries")
+    assert r.status_code == 403
+
+
+async def test_admin_queries_aggregates_by_normalized_query(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+            # Two searches for 'hiking boots' (mixed case) + one click +
+            # one unrelated query for 'tent stakes'.
+            await conn.execute(
+                "INSERT INTO search_events (session_id, query, event_type, latency_ms) "
+                "VALUES ('s', 'Hiking Boots', 'search', 100), "
+                "       ('s', 'hiking boots', 'search', 200)"
+            )
+            await conn.execute(
+                "INSERT INTO search_events (session_id, query, event_type, result_id) "
+                "VALUES ('s', 'hiking boots', 'click', 1)"
+            )
+            await conn.execute(
+                "INSERT INTO search_events (session_id, query, event_type, latency_ms) "
+                "VALUES ('s', 'tent stakes', 'search', 50)"
+            )
+    finally:
+        await pool.close()
+
+    r = await app_client.get(
+        "/admin/queries?since_hours=24&limit=10",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    by_query = {row["query"]: row for row in body["queries"]}
+    assert "hiking boots" in by_query
+    assert by_query["hiking boots"]["searches"] == 2
+    assert by_query["hiking boots"]["clicks"] == 1
+    assert by_query["hiking boots"]["mean_latency_ms"] == 150  # (100+200)/2
+    assert by_query["tent stakes"]["searches"] == 1
+
+
+async def test_admin_queries_rejects_out_of_range(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    # since_hours has a ge=1/le=720 constraint — Query validator 422s.
+    r = await app_client.get(
+        "/admin/queries?since_hours=0",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 422
+
+
 async def test_admin_stats_returns_row_after_events(app_client, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
     pool = await create_pool(TEST_DATABASE_URL)

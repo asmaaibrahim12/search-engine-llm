@@ -6,6 +6,10 @@ import os
 import asyncpg
 from pgvector.asyncpg import register_vector
 
+from app.logging_setup import get_logger
+
+log = get_logger()
+
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -217,10 +221,14 @@ async def _bootstrap_extension(dsn: str, attempts: int = 6) -> None:
             if attempt == attempts - 1:
                 break
             delay = min(2 ** attempt, 15)
-            print(
-                f"Bootstrap connect failed ({exc!r}); retrying in {delay}s "
-                f"(attempt {attempt + 1}/{attempts})",
-                flush=True,
+            log.warning(
+                "bootstrap connect failed; retrying",
+                extra={
+                    "attempt": attempt + 1,
+                    "max_attempts": attempts,
+                    "delay_s": delay,
+                    "err": repr(exc),
+                },
             )
             await asyncio.sleep(delay)
     raise RuntimeError(
@@ -259,7 +267,7 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
             except asyncpg.PostgresError:
                 await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
     except Exception as exc:
-        print(f"refresh_result_ctr failed: {exc!r}", flush=True)
+        log.warning("refresh_result_ctr failed", extra={"err": repr(exc)})
 
 
 async def result_ctr_refresh_loop(
@@ -280,4 +288,4 @@ async def result_ctr_refresh_loop(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"result_ctr refresh loop: {exc!r}", flush=True)
+            log.warning("result_ctr refresh loop error", extra={"err": repr(exc)})

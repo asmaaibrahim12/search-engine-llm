@@ -21,6 +21,7 @@ from app import embeddings, events, rag, rerank, search
 from app.db import (
     create_pool, ensure_schema, refresh_result_ctr, result_ctr_refresh_loop,
 )
+from app.logging_setup import configure as configure_logging
 from app.text import strip_html
 
 load_dotenv()
@@ -57,6 +58,9 @@ PROMPT_TOP_K = 5   # top results passed into the LLM prompt
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure structured logging before anything else so the rest of
+    # startup (pool bootstrap, MV refresh) emits structured records.
+    configure_logging()
     # Warm both models so the first request doesn't pay the load cost.
     embeddings.get_model()
     rerank.get_reranker()
@@ -466,6 +470,75 @@ async def admin_metrics(request: Request) -> JSONResponse:
             "mean": int(latency["mean_ms"] or 0) if latency["n"] else None,
             "p95":  int(latency["p95_ms"]  or 0) if latency["n"] else None,
         },
+    })
+
+
+@app.get("/admin/queries")
+async def admin_top_queries(
+    request: Request,
+    since_hours: int = Query(24, ge=1, le=24 * 30),
+    limit: int = Query(50, ge=1, le=500),
+) -> JSONResponse:
+    """Top queries by volume over the last `since_hours` hours.
+
+    Handy for content ops: which queries drive traffic, how many clicks
+    vs. thumbs they earn, median latency. The aggregate is keyed on a
+    normalized (lowercased, trimmed) query string so minor capitalization
+    differences collapse together.
+    """
+    _require_admin(request)
+    sql = """
+    WITH window AS (
+        SELECT *
+        FROM search_events
+        WHERE occurred_at >= NOW() - ($1 || ' hours')::interval
+    ),
+    searches AS (
+        SELECT lower(trim(query)) AS q,
+               COUNT(*)           AS searches,
+               AVG(latency_ms)::int AS mean_latency_ms
+        FROM window
+        WHERE event_type = 'search'
+        GROUP BY 1
+    ),
+    engagements AS (
+        SELECT lower(trim(query)) AS q,
+               COUNT(*) FILTER (WHERE event_type = 'click')       AS clicks,
+               COUNT(*) FILTER (WHERE event_type = 'thumb_up')    AS thumbs_up,
+               COUNT(*) FILTER (WHERE event_type = 'thumb_down')  AS thumbs_down
+        FROM window
+        WHERE event_type IN ('click', 'thumb_up', 'thumb_down')
+        GROUP BY 1
+    )
+    SELECT COALESCE(s.q, e.q) AS query_norm,
+           COALESCE(s.searches, 0)           AS searches,
+           COALESCE(e.clicks, 0)             AS clicks,
+           COALESCE(e.thumbs_up, 0)          AS thumbs_up,
+           COALESCE(e.thumbs_down, 0)        AS thumbs_down,
+           s.mean_latency_ms                 AS mean_latency_ms
+    FROM searches s
+    FULL OUTER JOIN engagements e ON e.q = s.q
+    WHERE COALESCE(s.q, e.q) IS NOT NULL AND COALESCE(s.q, e.q) <> ''
+    ORDER BY COALESCE(s.searches, 0) DESC, COALESCE(e.clicks, 0) DESC
+    LIMIT $2
+    """
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(sql, str(since_hours), limit)
+    return JSONResponse({
+        "since_hours": since_hours,
+        "queries": [
+            {
+                "query": r["query_norm"],
+                "searches": int(r["searches"]),
+                "clicks": int(r["clicks"]),
+                "thumbs_up": int(r["thumbs_up"]),
+                "thumbs_down": int(r["thumbs_down"]),
+                "mean_latency_ms": (
+                    int(r["mean_latency_ms"]) if r["mean_latency_ms"] is not None else None
+                ),
+            }
+            for r in rows
+        ],
     })
 
 

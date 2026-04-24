@@ -24,6 +24,10 @@ from typing import Any
 import asyncpg
 from fastapi import Request, Response
 
+from app.logging_setup import get_logger
+
+log = get_logger()
+
 SESSION_COOKIE = "sid"
 SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
@@ -121,4 +125,7 @@ async def log_event(
                 json.dumps(metadata or {}),
             )
     except Exception as exc:
-        print(f"log_event failed: {exc!r}", flush=True)
+        log.warning(
+            "log_event failed",
+            extra={"event_type": event_type, "session_id": session_id, "err": repr(exc)},
+        )
