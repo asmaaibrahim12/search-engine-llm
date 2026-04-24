@@ -33,7 +33,7 @@ def _row_to_dict(row) -> dict[str, Any]:
         "title": row["title"],
         "body": row["body"],
         "score": float(row["score"]),
-        "item_type": row.get("item_type") if isinstance(row, dict) else row["item_type"],
+        "item_type": row["item_type"],
         "is_accepted": row["is_accepted"],
         "parent_id": row["parent_id"],
         "tags": list(row["tags"] or []),
@@ -80,12 +80,17 @@ async def search_by_vector(
 #   +0.005  if is_accepted          (about 1/4 of a full rank, deliberate
 #                                    bump without dominating retrieval)
 #   +0.002 * log1p(upvotes)         (caps out around +0.01 at 150 upvotes)
-#   +0.010 * clicks / max(impressions, 20)
+#   +0.010 * LEAST(clicks / max(impressions, 20), 1.0)
 #                                   (feedback-loop CTR from result_ctr;
 #                                    denominator floor of 20 acts as a
 #                                    shrinkage prior — rare items don't
-#                                    get a huge bump from 1/1 CTR; max
-#                                    bump ≈ +0.010 at 100% CTR)
+#                                    get a huge bump from 1/1 CTR. The
+#                                    LEAST(..., 1.0) clamp handles orphan
+#                                    clicks/thumbs whose matching search
+#                                    event predates the result_ids
+#                                    metadata — without it clicks > 0
+#                                    and impressions = 0 would bump by
+#                                    +0.0005 per click, unbounded.)
 #   +0.003 * (log1p(thumbs_up) - log1p(thumbs_down))
 #                                   (net thumb signal, log-shrunk so one
 #                                    thumb doesn't dominate, symmetric
@@ -118,9 +123,10 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.010 * (
+         + 0.010 * LEAST(
                COALESCE(f.clicks, 0)::float
-             / GREATEST(COALESCE(f.impressions, 0), 20)
+             / GREATEST(COALESCE(f.impressions, 0), 20),
+               1.0
            )
          + 0.003 * (
                ln(1 + COALESCE(f.thumbs_up, 0))
@@ -181,9 +187,10 @@ SELECT o.id,
          + COALESCE(1.0 / (60 + k.rnk), 0)
          + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
          + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.010 * (
+         + 0.010 * LEAST(
                COALESCE(f.clicks, 0)::float
-             / GREATEST(COALESCE(f.impressions, 0), 20)
+             / GREATEST(COALESCE(f.impressions, 0), 20),
+               1.0
            )
          + 0.003 * (
                ln(1 + COALESCE(f.thumbs_up, 0))

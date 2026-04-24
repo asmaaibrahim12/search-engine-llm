@@ -89,8 +89,16 @@ async def lifespan(app: FastAPI):
             refresh_task.cancel()
             try:
                 await refresh_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                # Don't block shutdown on a refresh-loop bug, but surface
+                # it — silently swallowing here has hidden real issues.
+                from app.logging_setup import get_logger
+                get_logger().warning(
+                    "refresh loop failed during shutdown",
+                    extra={"err": repr(exc)},
+                )
         await app.state.pool.close()
 
 

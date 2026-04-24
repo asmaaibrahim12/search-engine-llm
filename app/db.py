@@ -244,8 +244,12 @@ async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
+    """Apply the DDL. Wrapped in a transaction so a mid-way failure
+    doesn't leave us with the MV dropped but not recreated (and therefore
+    every subsequent hybrid query erroring on the LEFT JOIN)."""
     async with pool.acquire() as conn:
-        await conn.execute(SCHEMA_SQL)
+        async with conn.transaction():
+            await conn.execute(SCHEMA_SQL)
 
 
 async def refresh_result_ctr(pool: asyncpg.Pool) -> None:

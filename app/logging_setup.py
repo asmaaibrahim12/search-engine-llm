@@ -54,14 +54,15 @@ def configure() -> logging.Logger:
     interleaving stays sensible on Railway.
     """
     log = logging.getLogger(LOGGER_NAME)
-    if getattr(log, "_configured", False):
+    # Idempotency: if we've already added a handler, bail. Simpler and
+    # more obvious than stashing a sentinel attribute on the Logger.
+    if log.handlers:
         return log
     log.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(_JsonFormatter())
     log.addHandler(handler)
     log.propagate = False
-    log._configured = True  # type: ignore[attr-defined]
     return log
 
 

@@ -620,6 +620,39 @@ async def test_hybrid_search_surfaces_engagement_counts(pool):
     assert "impressions" in r
 
 
+async def test_hybrid_search_clamps_orphan_clicks(pool):
+    """Orphan clicks (clicks > impressions, e.g. legacy data pre-dating
+    the result_ids metadata) must not push the bump past its documented
+    ceiling of +0.010 — otherwise the feedback signal overwhelms RRF."""
+    from app.embeddings import embed_query
+
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE outdoors")
+        await conn.execute("TRUNCATE search_events RESTART IDENTITY")
+    await _seed(pool, [{"id": 80, "title": "avalanche safety for backcountry skiers"}])
+    # 200 distinct sessions click the same result; no search events (so
+    # impressions = 0 in the MV). Without the LEAST(..., 1.0) clamp the
+    # bump would be 0.010 * 200/20 = +0.100, which is ~3× what one RRF
+    # rank contributes.
+    for i in range(200):
+        await _insert_event(pool, result_id=80, event_type="click",
+                             session_id=f"orphan-{i}")
+    await _refresh_ctr(pool)
+
+    vec = embed_query("avalanche backcountry")
+    results = await search.hybrid_search(
+        pool, "avalanche backcountry", vec, k_retrieve=10, k_final=10,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r["clicks"] == 200
+    assert r["impressions"] == 0
+    # Max possible score with clamp: 2/61 (rank 1 in both halves) + 0.010
+    # (clamped click bump) ≈ 0.0428. Without clamp, it would be ~0.1328.
+    # Leave room for tiny numeric noise.
+    assert r["score"] <= 0.05, f"orphan clicks unbounded: score={r['score']}"
+
+
 async def test_hybrid_search_empty_ctr_is_noop(pool):
     """With no events logged, ranking should match the pre-feedback behavior:
     RRF score bounded by 2/61 when a doc is rank 1 in both halves."""
