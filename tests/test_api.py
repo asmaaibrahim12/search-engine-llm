@@ -213,6 +213,18 @@ async def test_admin_metrics_returns_expected_shape(app_client, monkeypatch):
     assert body["recent_search_latency_ms"]["mean"] is not None
 
 
+async def test_admin_dashboard_renders_without_token(app_client):
+    """The /admin shell page is static HTML — no data, no token needed.
+    It advertises the admin endpoints to anyone who knows the URL, but
+    every backing call goes through token-gated fetches in-browser."""
+    r = await app_client.get("/admin")
+    assert r.status_code == 200
+    assert 'id="tok"' in r.text
+    assert "/admin/metrics" in r.text
+    assert "/admin/queries" in r.text
+    assert "/admin/refresh_ctr" in r.text
+
+
 async def test_admin_queries_requires_token(app_client, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
     r = await app_client.get("/admin/queries")

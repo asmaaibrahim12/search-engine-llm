@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import embeddings, rerank, search  # noqa: E402
 from app.db import create_pool, ensure_schema  # noqa: E402
+from app.search import RankingConfig  # noqa: E402
 from eval.metrics import QueryMetrics, score_one, summarize  # noqa: E402
 
 load_dotenv()
@@ -59,15 +60,24 @@ async def pipeline_vector_rerank(pool, query: str) -> list[dict]:
     return rerank.rerank(query, candidates, top_k=K)
 
 
+# Sweep-aware pipelines: the global _RANKING_CONFIG is mutated by main()
+# when sweep CLI flags are passed, then threaded through to hybrid_search.
+# Using a module global rather than closure-ing it in lets us keep the
+# pipeline signatures stable (they're used as dict values in PIPELINES).
+_RANKING_CONFIG: RankingConfig = RankingConfig()
+
+
 async def pipeline_hybrid(pool, query: str) -> list[dict]:
     vec = embeddings.embed_query(query)
-    return await search.hybrid_search(pool, query, vec, k_retrieve=50, k_final=K)
+    return await search.hybrid_search(
+        pool, query, vec, k_retrieve=50, k_final=K, config=_RANKING_CONFIG,
+    )
 
 
 async def pipeline_hybrid_rerank(pool, query: str) -> list[dict]:
     vec = embeddings.embed_query(query)
     candidates = await search.hybrid_search(
-        pool, query, vec, k_retrieve=50, k_final=50
+        pool, query, vec, k_retrieve=50, k_final=50, config=_RANKING_CONFIG,
     )
     return rerank.rerank(query, candidates, top_k=K)
 
@@ -239,7 +249,26 @@ def main() -> None:
         help="Minimum thumbs_up count per (query, result_id) to count as a "
              "positive label. Raise this as traffic grows.",
     )
+    # Ranking-config sweep flags — anything passed here overrides the
+    # corresponding RankingConfig default for this run only. Unset fields
+    # stay at the default. Useful for grid searches.
+    for f in ("rrf-k", "accepted-bump", "upvote-coeff", "ctr-coeff",
+              "ctr-shrinkage-floor", "thumb-coeff"):
+        parser.add_argument(f"--{f}", type=float, default=None)
     args = parser.parse_args()
+
+    # Build a RankingConfig with overrides applied (int fields coerced).
+    overrides: dict[str, Any] = {}
+    if args.rrf_k is not None:                overrides["rrf_k"] = int(args.rrf_k)
+    if args.accepted_bump is not None:        overrides["accepted_bump"] = args.accepted_bump
+    if args.upvote_coeff is not None:         overrides["upvote_coeff"] = args.upvote_coeff
+    if args.ctr_coeff is not None:            overrides["ctr_coeff"] = args.ctr_coeff
+    if args.ctr_shrinkage_floor is not None:  overrides["ctr_shrinkage_floor"] = int(args.ctr_shrinkage_floor)
+    if args.thumb_coeff is not None:          overrides["thumb_coeff"] = args.thumb_coeff
+    if overrides:
+        global _RANKING_CONFIG
+        _RANKING_CONFIG = RankingConfig(**overrides)
+        print(f"Ranking overrides: {overrides}", flush=True)
 
     if not os.environ.get("DATABASE_URL"):
         sys.exit("DATABASE_URL is not set")

@@ -1,11 +1,52 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
+from functools import lru_cache
 from typing import Any, Sequence
 
 import asyncpg
 import numpy as np
 
 from app.embeddings import embed_query
+
+# -----------------------------------------------------------------------------
+# Ranking configuration
+# -----------------------------------------------------------------------------
+#
+# Every magic number the hybrid ranker uses lives on this dataclass so the
+# eval harness can sweep them without patching SQL strings. Values are
+# substituted into the SQL template at build time (numbers only, never
+# user input, so str.format is safe).
+
+
+@dataclass(frozen=True)
+class RankingConfig:
+    # Reciprocal Rank Fusion constant. 60 is the Cormack et al. default.
+    rrf_k: int = 60
+    # Additive bump when a result is an accepted answer.
+    accepted_bump: float = 0.005
+    # Coefficient on log1p(upvotes).
+    upvote_coeff: float = 0.002
+    # Coefficient on the (clamped) click rate from result_ctr.
+    ctr_coeff: float = 0.010
+    # Minimum denominator for the CTR rate — smaller values than this are
+    # treated as if we had this many impressions. Acts as a Bayesian
+    # shrinkage prior so 1/1 doesn't look like 100% CTR.
+    ctr_shrinkage_floor: int = 20
+    # Coefficient on log1p(thumbs_up) − log1p(thumbs_down).
+    thumb_coeff: float = 0.003
+
+    def __post_init__(self) -> None:
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"{f.name} must be numeric, got {type(v).__name__}")
+            if v < 0:
+                raise ValueError(f"{f.name} must be >= 0, got {v}")
+
+
+DEFAULT_CONFIG = RankingConfig()
+
 
 # -----------------------------------------------------------------------------
 # Vector-only search (fallback / testing)
@@ -73,29 +114,14 @@ async def search_by_vector(
 # gets included — important so that pure-keyword queries (e.g. exact product
 # names) aren't dropped just because the vector side didn't surface them, and
 # vice versa.
+#
+# Small additive authority bumps, in decreasing order of magnitude:
+#   +accepted_bump                        if is_accepted
+#   +upvote_coeff * log1p(upvotes)
+#   +ctr_coeff    * LEAST(clicks / max(impressions, floor), 1.0)
+#   +thumb_coeff  * (log1p(thumbs_up) - log1p(thumbs_down))
 
-# Hybrid: vector cosine + BM25, fused by Reciprocal Rank Fusion (k=60),
-# then small additive bumps for authority signals so high-quality answers
-# outrank equally-ranked low-quality ones:
-#   +0.005  if is_accepted          (about 1/4 of a full rank, deliberate
-#                                    bump without dominating retrieval)
-#   +0.002 * log1p(upvotes)         (caps out around +0.01 at 150 upvotes)
-#   +0.010 * LEAST(clicks / max(impressions, 20), 1.0)
-#                                   (feedback-loop CTR from result_ctr;
-#                                    denominator floor of 20 acts as a
-#                                    shrinkage prior — rare items don't
-#                                    get a huge bump from 1/1 CTR. The
-#                                    LEAST(..., 1.0) clamp handles orphan
-#                                    clicks/thumbs whose matching search
-#                                    event predates the result_ids
-#                                    metadata — without it clicks > 0
-#                                    and impressions = 0 would bump by
-#                                    +0.0005 per click, unbounded.)
-#   +0.003 * (log1p(thumbs_up) - log1p(thumbs_down))
-#                                   (net thumb signal, log-shrunk so one
-#                                    thumb doesn't dominate, symmetric
-#                                    around zero)
-HYBRID_SQL = """
+_HYBRID_TEMPLATE = """
 WITH vector_hits AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY content_embedding <=> $1) AS rnk
     FROM outdoors
@@ -119,16 +145,16 @@ SELECT o.id,
        o.tags,
        o.score AS upvotes,
        (
-           COALESCE(1.0 / (60 + v.rnk), 0)
-         + COALESCE(1.0 / (60 + k.rnk), 0)
-         + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
-         + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.010 * LEAST(
+           COALESCE(1.0 / ({rrf_k} + v.rnk), 0)
+         + COALESCE(1.0 / ({rrf_k} + k.rnk), 0)
+         + CASE WHEN o.is_accepted THEN {accepted_bump} ELSE 0 END
+         + {upvote_coeff} * ln(1 + GREATEST(o.score, 0))
+         + {ctr_coeff} * LEAST(
                COALESCE(f.clicks, 0)::float
-             / GREATEST(COALESCE(f.impressions, 0), 20),
+             / GREATEST(COALESCE(f.impressions, 0), {ctr_shrinkage_floor}),
                1.0
            )
-         + 0.003 * (
+         + {thumb_coeff} * (
                ln(1 + COALESCE(f.thumbs_up, 0))
              - ln(1 + COALESCE(f.thumbs_down, 0))
            )
@@ -151,7 +177,7 @@ LIMIT $4
 
 # Filter CTE — applied to both halves of the hybrid query so candidates
 # that would have been filtered out don't waste a slot in the top-50.
-_HYBRID_FILTERED_SQL = """
+_HYBRID_FILTERED_TEMPLATE = """
 WITH filtered AS (
     SELECT *
     FROM outdoors
@@ -183,16 +209,16 @@ SELECT o.id,
        o.tags,
        o.score AS upvotes,
        (
-           COALESCE(1.0 / (60 + v.rnk), 0)
-         + COALESCE(1.0 / (60 + k.rnk), 0)
-         + CASE WHEN o.is_accepted THEN 0.005 ELSE 0 END
-         + 0.002 * ln(1 + GREATEST(o.score, 0))
-         + 0.010 * LEAST(
+           COALESCE(1.0 / ({rrf_k} + v.rnk), 0)
+         + COALESCE(1.0 / ({rrf_k} + k.rnk), 0)
+         + CASE WHEN o.is_accepted THEN {accepted_bump} ELSE 0 END
+         + {upvote_coeff} * ln(1 + GREATEST(o.score, 0))
+         + {ctr_coeff} * LEAST(
                COALESCE(f.clicks, 0)::float
-             / GREATEST(COALESCE(f.impressions, 0), 20),
+             / GREATEST(COALESCE(f.impressions, 0), {ctr_shrinkage_floor}),
                1.0
            )
-         + 0.003 * (
+         + {thumb_coeff} * (
                ln(1 + COALESCE(f.thumbs_up, 0))
              - ln(1 + COALESCE(f.thumbs_down, 0))
            )
@@ -213,6 +239,30 @@ LIMIT $4
 """
 
 
+@lru_cache(maxsize=32)
+def _build_hybrid_sql(config: RankingConfig, filtered: bool) -> str:
+    """Render the SQL template with the config's numeric constants.
+
+    Cached by (config, filtered) so sweeping in the eval harness doesn't
+    re-render on every query. Values are all numeric (validated in
+    RankingConfig.__post_init__), so str.format is safe against injection.
+    """
+    template = _HYBRID_FILTERED_TEMPLATE if filtered else _HYBRID_TEMPLATE
+    return template.format(
+        rrf_k=config.rrf_k,
+        accepted_bump=config.accepted_bump,
+        upvote_coeff=config.upvote_coeff,
+        ctr_coeff=config.ctr_coeff,
+        ctr_shrinkage_floor=config.ctr_shrinkage_floor,
+        thumb_coeff=config.thumb_coeff,
+    )
+
+
+# Exposed for tests and anything external that reads the default SQL.
+HYBRID_SQL = _build_hybrid_sql(DEFAULT_CONFIG, filtered=False)
+_HYBRID_FILTERED_SQL = _build_hybrid_sql(DEFAULT_CONFIG, filtered=True)
+
+
 async def hybrid_search(
     pool: asyncpg.Pool,
     query: str,
@@ -223,16 +273,21 @@ async def hybrid_search(
     item_types: list[str] | None = None,
     accepted_only: bool = False,
     min_score: int | None = None,
+    config: RankingConfig = DEFAULT_CONFIG,
 ) -> list[dict[str, Any]]:
     """Hybrid vector + BM25 with optional filters.
 
     Filters are applied BEFORE retrieval (inside the CTE), not after,
     so candidates filtered away don't waste a slot in the top-k.
+
+    Pass `config=RankingConfig(...)` to override individual ranking
+    constants — useful for eval sweeps. The SQL is cached per config.
     """
+    sql = _build_hybrid_sql(config, filtered=True)
     arr = np.array(vector, dtype=np.float32)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            _HYBRID_FILTERED_SQL,
+            sql,
             arr, k_retrieve, query, k_final,
             tags or None,
             item_types or None,

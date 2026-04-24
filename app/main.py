@@ -329,8 +329,8 @@ async def summary_endpoint(
 # -----------------------------------------------------------------------------
 
 
-def _assert_rate_limit(session_id: str) -> None:
-    if not events.rate_limit_ok(session_id):
+async def _assert_rate_limit(pool, session_id: str) -> None:
+    if not await events.rate_limit_ok(pool, session_id):
         raise HTTPException(
             status_code=429,
             detail="Too many events from this session; try again in a minute.",
@@ -347,7 +347,7 @@ async def log_click(
     position: int = Form(...),
 ) -> str:
     session_id = events.get_or_create_session(request, response)
-    _assert_rate_limit(session_id)
+    await _assert_rate_limit(request.app.state.pool, session_id)
     background.add_task(
         events.log_event,
         request.app.state.pool,
@@ -372,7 +372,7 @@ async def log_thumb(
     if vote not in ("up", "down"):
         raise HTTPException(status_code=400, detail="vote must be 'up' or 'down'")
     session_id = events.get_or_create_session(request, response)
-    _assert_rate_limit(session_id)
+    await _assert_rate_limit(request.app.state.pool, session_id)
     background.add_task(
         events.log_event,
         request.app.state.pool,
@@ -382,6 +382,14 @@ async def log_thumb(
         pipeline="hybrid_rerank",
     )
     return ""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request) -> HTMLResponse:
+    """Static HTML shell for the admin dashboard. Not token-gated on its
+    own — all the data it shows goes through token-gated API calls, so
+    the page itself leaks nothing beyond its existence."""
+    return templates.TemplateResponse(request, "admin.html", {})
 
 
 # -----------------------------------------------------------------------------

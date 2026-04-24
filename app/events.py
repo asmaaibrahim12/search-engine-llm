@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import uuid
-from collections import defaultdict, deque
 from typing import Any
 
 import asyncpg
@@ -41,12 +39,33 @@ def _cookie_secure() -> bool:
     return os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
 
 
-# Token bucket per session: max 120 events per 60s window. Plenty for a
-# real user (10 results * a few searches/minute), catches runaway JS.
+# Max 120 events per 60s window per session. Plenty for a real user
+# (10 results * a few searches/minute), catches runaway JS.
 RATE_LIMIT_WINDOW_S = 60
 RATE_LIMIT_PER_WINDOW = 120
 
-_buckets: dict[str, deque[float]] = defaultdict(deque)
+# SQL UPSERT that atomically increments the per-session event counter
+# and returns the new count. If the stored window_start is older than
+# our window, we reset it — effectively a sliding counter that starts
+# fresh each time a session goes quiet for 60s.
+_RATE_LIMIT_SQL = """
+INSERT INTO rate_limit_buckets (session_id, window_start, count)
+VALUES ($1, NOW(), 1)
+ON CONFLICT (session_id) DO UPDATE SET
+    window_start = CASE
+        WHEN rate_limit_buckets.window_start
+             < NOW() - make_interval(secs => $2)
+        THEN NOW()
+        ELSE rate_limit_buckets.window_start
+    END,
+    count = CASE
+        WHEN rate_limit_buckets.window_start
+             < NOW() - make_interval(secs => $2)
+        THEN 1
+        ELSE rate_limit_buckets.count + 1
+    END
+RETURNING count
+"""
 
 
 def get_or_create_session(request: Request, response: Response) -> str:
@@ -78,18 +97,29 @@ def _is_uuid(s: str) -> bool:
         return False
 
 
-def rate_limit_ok(session_id: str) -> bool:
-    """Best-effort in-memory rate limit. Returns False if session is over
-    its quota in the last RATE_LIMIT_WINDOW_S seconds."""
-    now = time.monotonic()
-    bucket = _buckets[session_id]
-    cutoff = now - RATE_LIMIT_WINDOW_S
-    while bucket and bucket[0] < cutoff:
-        bucket.popleft()
-    if len(bucket) >= RATE_LIMIT_PER_WINDOW:
-        return False
-    bucket.append(now)
-    return True
+async def rate_limit_ok(pool: asyncpg.Pool, session_id: str) -> bool:
+    """Per-session token bucket, backed by Postgres.
+
+    Returns False if the session is over its quota in the last
+    RATE_LIMIT_WINDOW_S seconds; True otherwise.
+
+    Fails OPEN: if Postgres is unreachable or the query errors, we return
+    True so analytics plumbing doesn't take down the feedback endpoints.
+    A short-term over-count is a better outcome than dropping legitimate
+    clicks during a DB hiccup.
+    """
+    try:
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                _RATE_LIMIT_SQL, session_id, RATE_LIMIT_WINDOW_S,
+            )
+        return int(count) <= RATE_LIMIT_PER_WINDOW
+    except Exception as exc:
+        log.warning(
+            "rate_limit_ok fail-open",
+            extra={"session_id": session_id, "err": repr(exc)},
+        )
+        return True
 
 
 async def log_event(

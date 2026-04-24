@@ -115,6 +115,25 @@ CREATE INDEX IF NOT EXISTS search_events_query_idx
 
 
 -- ---------------------------------------------------------------------------
+-- rate_limit_buckets: one row per session for the per-minute event budget
+-- ---------------------------------------------------------------------------
+--
+-- Replaces the in-process deque bucket so the limit survives across
+-- workers / restarts. Single row per session, updated via UPSERT. Rows
+-- are opportunistically pruned by the maintenance loop (see
+-- prune_rate_limit_buckets) so idle sessions don't leak indefinitely.
+
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    session_id   TEXT PRIMARY KEY,
+    window_start TIMESTAMPTZ NOT NULL,
+    count        INT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS rate_limit_buckets_window_idx
+    ON rate_limit_buckets (window_start);
+
+
+-- ---------------------------------------------------------------------------
 -- result_ctr: per-result engagement aggregate used as a tiny ranking signal
 -- ---------------------------------------------------------------------------
 --
@@ -274,22 +293,53 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
         log.warning("refresh_result_ctr failed", extra={"err": repr(exc)})
 
 
-async def result_ctr_refresh_loop(
+async def prune_rate_limit_buckets(
+    pool: asyncpg.Pool, older_than_s: int = 86400
+) -> int:
+    """Delete rate_limit_buckets rows whose window_start is older than
+    `older_than_s` seconds. Returns rowcount for the log.
+
+    Called from the maintenance loop so idle sessions don't accumulate.
+    Cheap: the index on window_start makes this a range delete.
+    """
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM rate_limit_buckets "
+                "WHERE window_start < NOW() - make_interval(secs => $1)",
+                older_than_s,
+            )
+        # asyncpg returns the command tag (e.g. "DELETE 42") — parse the count.
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
+    except Exception as exc:
+        log.warning("prune_rate_limit_buckets failed", extra={"err": repr(exc)})
+        return 0
+
+
+async def maintenance_loop(
     pool: asyncpg.Pool, interval_s: int
 ) -> None:
-    """Periodically refresh result_ctr in the background.
+    """Periodically refresh result_ctr and prune idle rate-limit rows.
 
     Meant to be scheduled from main.lifespan via asyncio.create_task.
     Sleeps first so an initial refresh (done explicitly at startup) isn't
-    immediately re-run. Cancellation during sleep/refresh is the normal
-    shutdown path; anything else we log and continue so a single bad
-    refresh doesn't kill the loop for the rest of the process lifetime.
+    immediately re-run. Cancellation during sleep is the normal shutdown
+    path; anything else we log and continue so a single bad iteration
+    doesn't kill the loop for the rest of the process lifetime.
     """
     while True:
         try:
             await asyncio.sleep(interval_s)
             await refresh_result_ctr(pool)
+            await prune_rate_limit_buckets(pool)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("result_ctr refresh loop error", extra={"err": repr(exc)})
+            log.warning("maintenance loop error", extra={"err": repr(exc)})
+
+
+# Backwards-compatible alias for external callers that imported the old name.
+result_ctr_refresh_loop = maintenance_loop
