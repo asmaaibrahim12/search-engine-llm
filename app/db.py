@@ -267,16 +267,28 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
     doesn't leave us with the MV dropped but not recreated (and therefore
     every subsequent hybrid query erroring on the LEFT JOIN).
 
-    Postgres on Railway's pgvector template ships with /dev/shm pinned at
-    64 MB. Parallel-query workers materialize hash tables there, so even
-    a moderately heavy aggregation can crash startup with DiskFullError.
-    SET LOCAL keeps the planner serial and the per-op work_mem small for
-    the schema bootstrap; the constraints scope to this transaction.
+    Postgres on Railway's pgvector template ships with /dev/shm pinned
+    at 64 MB. THREE separate things in this schema can grow shared
+    memory past that limit:
+
+      * Parallel-query plans (CREATE MATERIALIZED VIEW runs the
+        underlying SELECT) — controlled by max_parallel_workers_per_gather.
+      * Parallel index builds (HNSW + GIN) — controlled by
+        max_parallel_maintenance_workers, which is a SEPARATE GUC and
+        defaults to 2 even when the gather one is 0. This is the one
+        that bit us first deploy after the schema-setup fix.
+      * The maintenance_work_mem allocation each index-build worker
+        keeps in its own dsm segment.
+
+    SET LOCAL covers the whole transaction, so all three constraints
+    apply to every statement in SCHEMA_SQL.
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+            await conn.execute("SET LOCAL max_parallel_maintenance_workers = 0")
             await conn.execute("SET LOCAL work_mem = '4MB'")
+            await conn.execute("SET LOCAL maintenance_work_mem = '32MB'")
             await conn.execute(SCHEMA_SQL)
 
 
@@ -298,7 +310,12 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
     """
     try:
         async with pool.acquire() as conn:
+            # Same cap stack as ensure_schema — see the comment there for
+            # why all three GUCs matter on Railway's 64 MB /dev/shm.
+            # REFRESH itself doesn't build indexes, but the underlying
+            # SELECT can still trigger parallel workers.
             await conn.execute("SET max_parallel_workers_per_gather = 0")
+            await conn.execute("SET max_parallel_maintenance_workers = 0")
             await conn.execute("SET work_mem = '4MB'")
             try:
                 try:
@@ -309,6 +326,7 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
                     await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
             finally:
                 await conn.execute("RESET max_parallel_workers_per_gather")
+                await conn.execute("RESET max_parallel_maintenance_workers")
                 await conn.execute("RESET work_mem")
     except Exception as exc:
         log.warning("refresh_result_ctr failed", extra={"err": repr(exc)})
