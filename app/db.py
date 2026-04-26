@@ -265,9 +265,18 @@ async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
 async def ensure_schema(pool: asyncpg.Pool) -> None:
     """Apply the DDL. Wrapped in a transaction so a mid-way failure
     doesn't leave us with the MV dropped but not recreated (and therefore
-    every subsequent hybrid query erroring on the LEFT JOIN)."""
+    every subsequent hybrid query erroring on the LEFT JOIN).
+
+    Postgres on Railway's pgvector template ships with /dev/shm pinned at
+    64 MB. Parallel-query workers materialize hash tables there, so even
+    a moderately heavy aggregation can crash startup with DiskFullError.
+    SET LOCAL keeps the planner serial and the per-op work_mem small for
+    the schema bootstrap; the constraints scope to this transaction.
+    """
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+            await conn.execute("SET LOCAL work_mem = '4MB'")
             await conn.execute(SCHEMA_SQL)
 
 
@@ -280,15 +289,27 @@ async def refresh_result_ctr(pool: asyncpg.Pool) -> None:
     Best-effort: swallows errors so a refresh failure never crashes the
     app. Falls back to a non-concurrent refresh on first call (when the
     MV has never been populated, CONCURRENTLY raises).
+
+    REFRESH ... CONCURRENTLY can't run inside a transaction block, so we
+    use session-level SET (rather than SET LOCAL) and RESET in a finally
+    block — otherwise the connection returns to the pool with our
+    constraints sticking. Same goal as ensure_schema: keep the planner
+    serial and work_mem small so we don't hit Railway's 64 MB /dev/shm.
     """
     try:
         async with pool.acquire() as conn:
+            await conn.execute("SET max_parallel_workers_per_gather = 0")
+            await conn.execute("SET work_mem = '4MB'")
             try:
-                await conn.execute(
-                    "REFRESH MATERIALIZED VIEW CONCURRENTLY result_ctr"
-                )
-            except asyncpg.PostgresError:
-                await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+                try:
+                    await conn.execute(
+                        "REFRESH MATERIALIZED VIEW CONCURRENTLY result_ctr"
+                    )
+                except asyncpg.PostgresError:
+                    await conn.execute("REFRESH MATERIALIZED VIEW result_ctr")
+            finally:
+                await conn.execute("RESET max_parallel_workers_per_gather")
+                await conn.execute("RESET work_mem")
     except Exception as exc:
         log.warning("refresh_result_ctr failed", extra={"err": repr(exc)})
 

@@ -271,6 +271,31 @@ async def test_rate_limit_fails_open_on_db_error(rl_pool):
 
 @pytest.mark.asyncio
 @needs_db
+async def test_refresh_result_ctr_resets_session_settings():
+    """SET (not SET LOCAL) is required because REFRESH CONCURRENTLY can't
+    run inside a transaction. We must RESET in finally so the connection
+    returns to the pool with stock settings — otherwise the next checkout
+    inherits parallel=0 / work_mem=4MB and queries get slow silently."""
+    from app.db import refresh_result_ctr
+    p = await create_pool(TEST_DATABASE_URL)
+    try:
+        await ensure_schema(p)
+        await refresh_result_ctr(p)
+        # Drain other connections, force a fresh acquire that should
+        # see stock settings (or at least not our overrides).
+        async with p.acquire() as conn:
+            workers = await conn.fetchval("SHOW max_parallel_workers_per_gather")
+            wm = await conn.fetchval("SHOW work_mem")
+        # Stock Postgres default is 2 (or whatever the server config has);
+        # whatever it is, our refresh forced 0 — assert we didn't leak it.
+        assert workers != "0", f"max_parallel_workers_per_gather leaked: {workers}"
+        assert wm != "4MB", f"work_mem leaked: {wm}"
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@needs_db
 async def test_prune_rate_limit_buckets_drops_old_rows():
     from app.db import prune_rate_limit_buckets
     p = await create_pool(TEST_DATABASE_URL)

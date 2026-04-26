@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+# sentence_transformers (and its torch dependency) is a ~1.5 GB install.
+# The CI's "unit" tier intentionally doesn't ship it, so we defer the
+# import until get_model() is actually called. Module-level constants
+# and pure-Python helpers like normalize() stay importable without it.
+if TYPE_CHECKING:  # pragma: no cover
+    from sentence_transformers import SentenceTransformer
 
 # BAAI/bge-base-en-v1.5 — retrieval-tuned sentence encoder, 768-dim.
 # Strictly better than the older roberta-base-nli-stsb-mean-tokens on
@@ -21,6 +29,7 @@ _model: SentenceTransformer | None = None
 def get_model() -> SentenceTransformer:
     global _model
     if _model is None:
+        from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer(MODEL_NAME)
     return _model
 
