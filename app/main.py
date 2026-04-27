@@ -130,10 +130,15 @@ async def healthz() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request, "index.html",
         {"top_tags": getattr(request.app.state, "top_tags", [])},
     )
+    # Railway routes traffic through Fastly, which will happily cache HTML
+    # for a long time by default. The index page is cheap to render and we
+    # WANT every deploy to be visible immediately — so opt out explicitly.
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.post("/search", response_class=HTMLResponse)
