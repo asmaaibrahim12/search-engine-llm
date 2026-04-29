@@ -7,7 +7,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import (
@@ -603,33 +603,61 @@ async def admin_eval_run(
     request: Request,
     background: BackgroundTasks,
     pipelines: Optional[List[str]] = Query(default=None),
+    rrf_k: Optional[int] = Query(default=None, ge=1),
+    accepted_bump: Optional[float] = Query(default=None, ge=0),
+    upvote_coeff: Optional[float] = Query(default=None, ge=0),
+    ctr_coeff: Optional[float] = Query(default=None, ge=0),
+    ctr_shrinkage_floor: Optional[int] = Query(default=None, ge=1),
+    thumb_coeff: Optional[float] = Query(default=None, ge=0),
 ) -> JSONResponse:
     """Kick off a new eval run in the background. Returns immediately with
-    the new run_id; poll /admin/eval/runs for status."""
+    the new run_id; poll /admin/eval/runs for status.
+
+    Any of the ranking-config knobs left unset stay at the DEFAULT_CONFIG
+    value. Validation (non-negative numerics, RRF k >= 1) is done both by
+    FastAPI's Query bounds and by RankingConfig.__post_init__.
+    """
     _require_admin(request)
     from app import eval_runner
-    from app.search import DEFAULT_CONFIG
+    from app.search import DEFAULT_CONFIG, RankingConfig
 
     valid = {"vector", "vector_rerank", "hybrid", "hybrid_rerank"}
     chosen = [p for p in (pipelines or list(valid)) if p in valid]
     if not chosen:
         raise HTTPException(400, "no valid pipelines selected")
 
+    overrides: dict[str, Any] = {}
+    if rrf_k is not None:                overrides["rrf_k"] = rrf_k
+    if accepted_bump is not None:        overrides["accepted_bump"] = accepted_bump
+    if upvote_coeff is not None:         overrides["upvote_coeff"] = upvote_coeff
+    if ctr_coeff is not None:            overrides["ctr_coeff"] = ctr_coeff
+    if ctr_shrinkage_floor is not None:  overrides["ctr_shrinkage_floor"] = ctr_shrinkage_floor
+    if thumb_coeff is not None:          overrides["thumb_coeff"] = thumb_coeff
+    try:
+        config = RankingConfig(**overrides) if overrides else DEFAULT_CONFIG
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"bad ranking config override: {exc}")
+
     queries = eval_runner.load_curated_queries()
     pool = request.app.state.pool
     run_id = await eval_runner.create_run(
-        pool, pipelines=chosen, config=DEFAULT_CONFIG, n_queries=len(queries),
+        pool, pipelines=chosen, config=config, n_queries=len(queries),
     )
     background.add_task(
         eval_runner.run_eval,
         pool,
         pipelines=chosen,
         queries=queries,
-        config=DEFAULT_CONFIG,
+        config=config,
         run_id=run_id,
     )
-    return JSONResponse({"run_id": run_id, "n_queries": len(queries),
-                         "pipelines": chosen, "status": "running"})
+    return JSONResponse({
+        "run_id": run_id,
+        "n_queries": len(queries),
+        "pipelines": chosen,
+        "status": "running",
+        "overrides": overrides,
+    })
 
 
 @app.get("/admin/eval/runs")
@@ -646,7 +674,7 @@ async def admin_eval_runs(
         rows = await conn.fetch(
             """
             SELECT id, started_at, finished_at, status, pipelines,
-                   n_queries, summary, error
+                   n_queries, summary, config, error
             FROM eval_runs
             ORDER BY started_at DESC
             LIMIT $1
@@ -663,6 +691,7 @@ async def admin_eval_runs(
             "pipelines":    list(r["pipelines"] or []),
             "n_queries":    r["n_queries"],
             "summary":      _json.loads(r["summary"] or "{}"),
+            "config":       _json.loads(r["config"] or "{}"),
             "error":        r["error"],
         })
     return JSONResponse({"runs": out})

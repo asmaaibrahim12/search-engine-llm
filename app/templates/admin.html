@@ -118,16 +118,61 @@
   <div class="card">
     <h2>Retrieval eval <span class="hint">— /admin/eval/*</span></h2>
     <div class="row">
-      <button id="run-eval">Run eval (all pipelines)</button>
-      <button id="refresh-runs">Refresh history</button>
+      <button id="run-eval">Run eval</button>
+      <button id="toggle-eval-config" type="button"
+              style="background: transparent; color: var(--ink-muted); border-color: var(--border)">
+        Custom config…
+      </button>
+      <button id="refresh-runs" type="button"
+              style="background: transparent; color: var(--ink-muted); border-color: var(--border)">
+        Refresh history
+      </button>
       <span id="eval-status" class="hint"></span>
     </div>
     <p class="hint" style="margin: 8px 0 0">
-      Each run scores the labeled queries from
-      <code>eval/queries.json</code> through the chosen pipelines and
-      stores recall@10, precision@10, MRR, and p95 latency. Background
-      task — full run takes 30–60&nbsp;s.
+      Scores the labeled queries from <code>eval/queries.json</code>
+      through the chosen pipelines. Stores recall@10, precision@10,
+      MRR, and p95 latency. Background task — full run takes 30–60&nbsp;s.
     </p>
+
+    <div id="eval-config" style="display: none; margin-top: 12px;
+                                  padding: 10px; border: 1px dashed var(--border);
+                                  border-radius: 6px">
+      <div class="hint" style="margin-bottom: 6px">
+        Empty fields use the DEFAULT_CONFIG value. Overrides land in
+        <code>eval_runs.config</code> so swept runs are comparable later.
+      </div>
+      <div class="row">
+        <label class="hint">pipelines
+          <select id="cfg-pipelines" multiple size="4"
+                  style="font-family: var(--mono); font-size: 12px; min-width: 160px">
+            <option value="vector" selected>vector</option>
+            <option value="vector_rerank" selected>vector_rerank</option>
+            <option value="hybrid" selected>hybrid</option>
+            <option value="hybrid_rerank" selected>hybrid_rerank</option>
+          </select>
+        </label>
+        <label class="hint">rrf_k <small>(60)</small>
+          <input id="cfg-rrf-k" type="number" min="1" placeholder="60" style="width: 80px" />
+        </label>
+        <label class="hint">accepted_bump <small>(0.005)</small>
+          <input id="cfg-accepted-bump" type="number" step="0.001" min="0" placeholder="0.005" style="width: 90px" />
+        </label>
+        <label class="hint">upvote_coeff <small>(0.002)</small>
+          <input id="cfg-upvote-coeff" type="number" step="0.001" min="0" placeholder="0.002" style="width: 90px" />
+        </label>
+        <label class="hint">ctr_coeff <small>(0.010)</small>
+          <input id="cfg-ctr-coeff" type="number" step="0.001" min="0" placeholder="0.010" style="width: 90px" />
+        </label>
+        <label class="hint">ctr_shrinkage_floor <small>(20)</small>
+          <input id="cfg-ctr-shrinkage" type="number" min="1" placeholder="20" style="width: 80px" />
+        </label>
+        <label class="hint">thumb_coeff <small>(0.003)</small>
+          <input id="cfg-thumb-coeff" type="number" step="0.001" min="0" placeholder="0.003" style="width: 90px" />
+        </label>
+      </div>
+    </div>
+
     <div id="eval-runs" style="margin-top: 12px"><span class="hint">(not loaded)</span></div>
     <div id="eval-detail" style="margin-top: 12px"></div>
   </div>
@@ -255,6 +300,28 @@
     function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
     function fmtFloat(x) { return Number(x).toFixed(3); }
 
+    // Mirror RankingConfig defaults from app/search.py. Used to compute
+    // which fields are "overridden" on a stored run so the dashboard can
+    // tag runs that were swept vs. baseline.
+    const DEFAULT_CONFIG = {
+      rrf_k: 60,
+      accepted_bump: 0.005,
+      upvote_coeff: 0.002,
+      ctr_coeff: 0.010,
+      ctr_shrinkage_floor: 20,
+      thumb_coeff: 0.003,
+    };
+    function configOverrides(cfg) {
+      if (!cfg) return [];
+      const out = [];
+      for (const [k, v] of Object.entries(cfg)) {
+        if (DEFAULT_CONFIG[k] !== undefined && v !== DEFAULT_CONFIG[k]) {
+          out.push(`${k}=${v}`);
+        }
+      }
+      return out;
+    }
+
     async function loadEvalRuns() {
       const el = $('eval-runs');
       el.innerHTML = '<span class="hint">loading…</span>';
@@ -282,10 +349,14 @@
                       <td class="num">${Math.round(s.p95_latency_ms)}</td>
                     </tr>`;
           }).join('');
+          const overrides = configOverrides(r.config);
+          const cfgTag = overrides.length
+            ? ` · <span class="hint" title="config overrides vs. default">⚙ ${escapeHtml(overrides.join(', '))}</span>`
+            : '';
           return `
             <tr><td colspan="4">
               <strong>#${r.id}</strong> · ${status} ${r.status}
-              · ${ts} · ${r.n_queries ?? '?'} queries
+              · ${ts} · ${r.n_queries ?? '?'} queries${cfgTag}
               <button data-run="${r.id}" class="eval-detail-btn"
                       style="margin-left: 12px; padding: 2px 8px; font-size: 11px">
                 detail
@@ -338,12 +409,43 @@
       } catch (e) { renderError(el, e); }
     }
 
+    function evalRunQueryString() {
+      // Build a query string from the (optional) custom-config form. Only
+      // include fields the user actually filled in so unset ones fall
+      // through to RankingConfig defaults server-side.
+      const params = new URLSearchParams();
+      const pipes = Array.from($('cfg-pipelines').selectedOptions).map(o => o.value);
+      pipes.forEach(p => params.append('pipelines', p));
+      const map = {
+        'cfg-rrf-k':         'rrf_k',
+        'cfg-accepted-bump': 'accepted_bump',
+        'cfg-upvote-coeff':  'upvote_coeff',
+        'cfg-ctr-coeff':     'ctr_coeff',
+        'cfg-ctr-shrinkage': 'ctr_shrinkage_floor',
+        'cfg-thumb-coeff':   'thumb_coeff',
+      };
+      for (const [domId, paramName] of Object.entries(map)) {
+        const v = $(domId).value;
+        if (v !== '' && v !== null) params.set(paramName, v);
+      }
+      const s = params.toString();
+      return s ? '?' + s : '';
+    }
+
+    $('toggle-eval-config').onclick = () => {
+      const el = $('eval-config');
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    };
+
     $('run-eval').onclick = async () => {
       const s = $('eval-status');
       s.textContent = 'starting…';
       try {
-        const r = await adminFetch('/admin/eval/run', { method: 'POST' });
-        s.textContent = `started run #${r.run_id} (${r.n_queries} queries) — refreshing…`;
+        const r = await adminFetch('/admin/eval/run' + evalRunQueryString(),
+                                   { method: 'POST' });
+        const overrides = r.overrides && Object.keys(r.overrides).length
+          ? ` · ${Object.keys(r.overrides).length} override(s)` : '';
+        s.textContent = `started run #${r.run_id} (${r.n_queries} queries${overrides}) — refreshing…`;
         await loadEvalRuns();
       } catch (e) { s.textContent = String(e.message || e); }
     };

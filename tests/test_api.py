@@ -289,6 +289,49 @@ async def test_admin_eval_run_rejects_unknown_pipelines(app_client, monkeypatch)
     assert r.status_code == 400
 
 
+async def test_admin_eval_run_persists_config_overrides(app_client, monkeypatch):
+    """RankingConfig overrides land in eval_runs.config so swept runs are
+    comparable later. The endpoint also echoes the overrides back."""
+    import json as _json
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE eval_runs RESTART IDENTITY CASCADE")
+        r = await app_client.post(
+            "/admin/eval/run?pipelines=vector&rrf_k=40&ctr_coeff=0.05",
+            headers={"X-Admin-Token": "s3cret"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["overrides"] == {"rrf_k": 40, "ctr_coeff": 0.05}
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT config FROM eval_runs WHERE id = $1", body["run_id"],
+            )
+        cfg = _json.loads(row["config"])
+        # Overridden fields take their new values; unset fields stay at
+        # the dataclass defaults.
+        assert cfg["rrf_k"] == 40
+        assert cfg["ctr_coeff"] == 0.05
+        assert cfg["accepted_bump"] == 0.005   # default — unchanged
+    finally:
+        await pool.close()
+
+
+async def test_admin_eval_run_rejects_negative_overrides(app_client, monkeypatch):
+    """Query-bound ge=0 catches negatives at the FastAPI layer; assert that
+    the validation actually fires (RankingConfig.__post_init__ would also
+    catch it but we don't want a 500 — we want a clean 422)."""
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post(
+        "/admin/eval/run?pipelines=vector&ctr_coeff=-1",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 422
+
+
 async def test_admin_eval_run_detail_404s_unknown_run(app_client, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
     r = await app_client.get(
