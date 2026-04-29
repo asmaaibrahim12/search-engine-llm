@@ -7,7 +7,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import (
@@ -582,6 +582,163 @@ async def admin_top_queries(
                 "mean_latency_ms": (
                     int(r["mean_latency_ms"]) if r["mean_latency_ms"] is not None else None
                 ),
+            }
+            for r in rows
+        ],
+    })
+
+
+# -----------------------------------------------------------------------------
+# Eval dashboard endpoints — same admin gate as the rest of /admin/*
+# -----------------------------------------------------------------------------
+#
+# Each /admin/eval/run kicks off a background task that runs the offline
+# eval against the labeled query set (eval/queries.json) and persists per-
+# pipeline + per-query metrics to eval_runs / eval_run_results. The dashboard
+# polls /admin/eval/runs to render history and drill-in.
+
+
+@app.post("/admin/eval/run")
+async def admin_eval_run(
+    request: Request,
+    background: BackgroundTasks,
+    pipelines: Optional[List[str]] = Query(default=None),
+    rrf_k: Optional[int] = Query(default=None, ge=1),
+    accepted_bump: Optional[float] = Query(default=None, ge=0),
+    upvote_coeff: Optional[float] = Query(default=None, ge=0),
+    ctr_coeff: Optional[float] = Query(default=None, ge=0),
+    ctr_shrinkage_floor: Optional[int] = Query(default=None, ge=1),
+    thumb_coeff: Optional[float] = Query(default=None, ge=0),
+) -> JSONResponse:
+    """Kick off a new eval run in the background. Returns immediately with
+    the new run_id; poll /admin/eval/runs for status.
+
+    Any of the ranking-config knobs left unset stay at the DEFAULT_CONFIG
+    value. Validation (non-negative numerics, RRF k >= 1) is done both by
+    FastAPI's Query bounds and by RankingConfig.__post_init__.
+    """
+    _require_admin(request)
+    from app import eval_runner
+    from app.search import DEFAULT_CONFIG, RankingConfig
+
+    valid = {"vector", "vector_rerank", "hybrid", "hybrid_rerank"}
+    chosen = [p for p in (pipelines or list(valid)) if p in valid]
+    if not chosen:
+        raise HTTPException(400, "no valid pipelines selected")
+
+    overrides: dict[str, Any] = {}
+    if rrf_k is not None:                overrides["rrf_k"] = rrf_k
+    if accepted_bump is not None:        overrides["accepted_bump"] = accepted_bump
+    if upvote_coeff is not None:         overrides["upvote_coeff"] = upvote_coeff
+    if ctr_coeff is not None:            overrides["ctr_coeff"] = ctr_coeff
+    if ctr_shrinkage_floor is not None:  overrides["ctr_shrinkage_floor"] = ctr_shrinkage_floor
+    if thumb_coeff is not None:          overrides["thumb_coeff"] = thumb_coeff
+    try:
+        config = RankingConfig(**overrides) if overrides else DEFAULT_CONFIG
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"bad ranking config override: {exc}")
+
+    queries = eval_runner.load_curated_queries()
+    pool = request.app.state.pool
+    run_id = await eval_runner.create_run(
+        pool, pipelines=chosen, config=config, n_queries=len(queries),
+    )
+    background.add_task(
+        eval_runner.run_eval,
+        pool,
+        pipelines=chosen,
+        queries=queries,
+        config=config,
+        run_id=run_id,
+    )
+    return JSONResponse({
+        "run_id": run_id,
+        "n_queries": len(queries),
+        "pipelines": chosen,
+        "status": "running",
+        "overrides": overrides,
+    })
+
+
+@app.get("/admin/eval/runs")
+async def admin_eval_runs(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+) -> JSONResponse:
+    """List recent eval runs with their summary metrics (status, pipelines,
+    per-pipeline recall@10 / MRR / p95 latency)."""
+    _require_admin(request)
+    import json as _json
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, started_at, finished_at, status, pipelines,
+                   n_queries, summary, config, error
+            FROM eval_runs
+            ORDER BY started_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    out = []
+    for r in rows:
+        out.append({
+            "id":           int(r["id"]),
+            "started_at":   r["started_at"].isoformat(),
+            "finished_at":  r["finished_at"].isoformat() if r["finished_at"] else None,
+            "status":       r["status"],
+            "pipelines":    list(r["pipelines"] or []),
+            "n_queries":    r["n_queries"],
+            "summary":      _json.loads(r["summary"] or "{}"),
+            "config":       _json.loads(r["config"] or "{}"),
+            "error":        r["error"],
+        })
+    return JSONResponse({"runs": out})
+
+
+@app.get("/admin/eval/runs/{run_id}")
+async def admin_eval_run_detail(
+    request: Request, run_id: int,
+) -> JSONResponse:
+    """Per-(pipeline, query) breakdown for one run."""
+    _require_admin(request)
+    import json as _json
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        run = await conn.fetchrow(
+            "SELECT * FROM eval_runs WHERE id = $1", run_id,
+        )
+        if run is None:
+            raise HTTPException(404, "run not found")
+        rows = await conn.fetch(
+            """
+            SELECT pipeline, query, n_relevant, precision_at_k,
+                   recall_at_k, rr, latency_ms
+            FROM eval_run_results
+            WHERE run_id = $1
+            ORDER BY pipeline, query
+            """,
+            run_id,
+        )
+    return JSONResponse({
+        "id":           int(run["id"]),
+        "started_at":   run["started_at"].isoformat(),
+        "finished_at":  run["finished_at"].isoformat() if run["finished_at"] else None,
+        "status":       run["status"],
+        "pipelines":    list(run["pipelines"] or []),
+        "n_queries":    run["n_queries"],
+        "summary":      _json.loads(run["summary"] or "{}"),
+        "error":        run["error"],
+        "results": [
+            {
+                "pipeline":        r["pipeline"],
+                "query":           r["query"],
+                "n_relevant":      int(r["n_relevant"]),
+                "precision_at_k":  float(r["precision_at_k"]),
+                "recall_at_k":     float(r["recall_at_k"]),
+                "rr":              float(r["rr"]),
+                "latency_ms":      int(r["latency_ms"]),
             }
             for r in rows
         ],

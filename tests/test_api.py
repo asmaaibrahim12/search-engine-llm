@@ -240,6 +240,107 @@ async def test_admin_metrics_returns_expected_shape(app_client, monkeypatch):
     assert body["recent_search_latency_ms"]["mean"] is not None
 
 
+async def test_admin_eval_runs_requires_token(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.get("/admin/eval/runs")
+    assert r.status_code == 403
+
+
+async def test_admin_eval_run_creates_row_and_returns_id(app_client, monkeypatch):
+    """POST /admin/eval/run must insert a row and return immediately with
+    a run_id; the actual eval runs in the background."""
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE eval_runs RESTART IDENTITY CASCADE")
+        # Restrict to vector-only so the background task is fast and doesn't
+        # need /summary (still independent — backgrounds run in the app's loop).
+        r = await app_client.post(
+            "/admin/eval/run?pipelines=vector",
+            headers={"X-Admin-Token": "s3cret"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["run_id"], int)
+        assert body["pipelines"] == ["vector"]
+        assert body["status"] == "running"
+
+        # Eventually the background task finalizes the row to 'done' or 'error';
+        # we just assert the row exists with the right initial shape.
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT pipelines, n_queries, status FROM eval_runs WHERE id = $1",
+                body["run_id"],
+            )
+        assert row is not None
+        assert "vector" in (row["pipelines"] or [])
+        assert row["n_queries"] == body["n_queries"]
+    finally:
+        await pool.close()
+
+
+async def test_admin_eval_run_rejects_unknown_pipelines(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post(
+        "/admin/eval/run?pipelines=nope",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 400
+
+
+async def test_admin_eval_run_persists_config_overrides(app_client, monkeypatch):
+    """RankingConfig overrides land in eval_runs.config so swept runs are
+    comparable later. The endpoint also echoes the overrides back."""
+    import json as _json
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    pool = await create_pool(TEST_DATABASE_URL)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE eval_runs RESTART IDENTITY CASCADE")
+        r = await app_client.post(
+            "/admin/eval/run?pipelines=vector&rrf_k=40&ctr_coeff=0.05",
+            headers={"X-Admin-Token": "s3cret"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["overrides"] == {"rrf_k": 40, "ctr_coeff": 0.05}
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT config FROM eval_runs WHERE id = $1", body["run_id"],
+            )
+        cfg = _json.loads(row["config"])
+        # Overridden fields take their new values; unset fields stay at
+        # the dataclass defaults.
+        assert cfg["rrf_k"] == 40
+        assert cfg["ctr_coeff"] == 0.05
+        assert cfg["accepted_bump"] == 0.005   # default — unchanged
+    finally:
+        await pool.close()
+
+
+async def test_admin_eval_run_rejects_negative_overrides(app_client, monkeypatch):
+    """Query-bound ge=0 catches negatives at the FastAPI layer; assert that
+    the validation actually fires (RankingConfig.__post_init__ would also
+    catch it but we don't want a 500 — we want a clean 422)."""
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.post(
+        "/admin/eval/run?pipelines=vector&ctr_coeff=-1",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 422
+
+
+async def test_admin_eval_run_detail_404s_unknown_run(app_client, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
+    r = await app_client.get(
+        "/admin/eval/runs/999999999",
+        headers={"X-Admin-Token": "s3cret"},
+    )
+    assert r.status_code == 404
+
+
 async def test_admin_dashboard_renders_without_token(app_client):
     """The /admin shell page is static HTML — no data, no token needed.
     It advertises the admin endpoints to anyone who knows the URL, but
@@ -250,6 +351,7 @@ async def test_admin_dashboard_renders_without_token(app_client):
     assert "/admin/metrics" in r.text
     assert "/admin/queries" in r.text
     assert "/admin/refresh_ctr" in r.text
+    assert "/admin/eval" in r.text
 
 
 async def test_admin_queries_requires_token(app_client, monkeypatch):
