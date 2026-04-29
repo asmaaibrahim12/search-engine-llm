@@ -115,6 +115,23 @@
     <span id="refresh-status" class="hint" style="margin-left: 12px"></span>
   </div>
 
+  <div class="card">
+    <h2>Retrieval eval <span class="hint">— /admin/eval/*</span></h2>
+    <div class="row">
+      <button id="run-eval">Run eval (all pipelines)</button>
+      <button id="refresh-runs">Refresh history</button>
+      <span id="eval-status" class="hint"></span>
+    </div>
+    <p class="hint" style="margin: 8px 0 0">
+      Each run scores the labeled queries from
+      <code>eval/queries.json</code> through the chosen pipelines and
+      stores recall@10, precision@10, MRR, and p95 latency. Background
+      task — full run takes 30–60&nbsp;s.
+    </p>
+    <div id="eval-runs" style="margin-top: 12px"><span class="hint">(not loaded)</span></div>
+    <div id="eval-detail" style="margin-top: 12px"></div>
+  </div>
+
   <script>
     const $ = (id) => document.getElementById(id);
 
@@ -234,9 +251,107 @@
       } catch (e) { s.textContent = String(e.message || e); }
     };
 
+    // --- Eval ------------------------------------------------------------
+    function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
+    function fmtFloat(x) { return Number(x).toFixed(3); }
+
+    async function loadEvalRuns() {
+      const el = $('eval-runs');
+      el.innerHTML = '<span class="hint">loading…</span>';
+      try {
+        const data = await adminFetch('/admin/eval/runs?limit=20');
+        if (!data.runs.length) {
+          el.innerHTML = '<span class="hint">(no runs yet)</span>';
+          return;
+        }
+        // Build an outer table with one row per run; each row has a
+        // "details" button that fetches per-(pipeline, query) numbers.
+        const rows = data.runs.map(r => {
+          const ts = new Date(r.started_at).toLocaleString();
+          const status = r.status === 'done' ? '✓' :
+                         r.status === 'error' ? '✗' :
+                         '⏳';
+          // Summary row: one entry per pipeline. Concise — recall / MRR / p95.
+          const pipes = (r.pipelines || []).map(p => {
+            const s = (r.summary || {})[p];
+            if (!s) return `<tr><td>${p}</td><td colspan="3" class="hint">running…</td></tr>`;
+            return `<tr>
+                      <td>${p}</td>
+                      <td class="num">${fmtPct(s.recall_at_k)}</td>
+                      <td class="num">${fmtFloat(s.mrr)}</td>
+                      <td class="num">${Math.round(s.p95_latency_ms)}</td>
+                    </tr>`;
+          }).join('');
+          return `
+            <tr><td colspan="4">
+              <strong>#${r.id}</strong> · ${status} ${r.status}
+              · ${ts} · ${r.n_queries ?? '?'} queries
+              <button data-run="${r.id}" class="eval-detail-btn"
+                      style="margin-left: 12px; padding: 2px 8px; font-size: 11px">
+                detail
+              </button>
+            </td></tr>
+            <tr><th>pipeline</th><th>recall@10</th><th>MRR</th><th>p95 ms</th></tr>
+            ${pipes || '<tr><td colspan="4" class="hint">no rows yet</td></tr>'}
+            ${r.error ? `<tr><td colspan="4" class="err">${escapeHtml(r.error)}</td></tr>` : ''}
+          `;
+        }).join('<tr><td colspan="4" style="border:0; padding:6px 0"></td></tr>');
+        el.innerHTML = `<table>${rows}</table>`;
+        el.querySelectorAll('button.eval-detail-btn').forEach(b => {
+          b.onclick = () => loadEvalDetail(b.dataset.run);
+        });
+      } catch (e) { renderError(el, e); }
+    }
+
+    async function loadEvalDetail(runId) {
+      const el = $('eval-detail');
+      el.innerHTML = '<span class="hint">loading run #' + runId + '…</span>';
+      try {
+        const d = await adminFetch(`/admin/eval/runs/${runId}`);
+        if (!d.results.length) {
+          el.innerHTML = `<span class="hint">run #${runId}: no per-query rows yet</span>`;
+          return;
+        }
+        // Group by pipeline so the table reads cleanly.
+        const byPipe = {};
+        for (const r of d.results) {
+          (byPipe[r.pipeline] ||= []).push(r);
+        }
+        const sections = Object.entries(byPipe).map(([pipe, rs]) => {
+          const trs = rs.map(r =>
+            `<tr>
+               <td>${escapeHtml(r.query)}</td>
+               <td class="num">${fmtFloat(r.recall_at_k)}</td>
+               <td class="num">${fmtFloat(r.precision_at_k)}</td>
+               <td class="num">${fmtFloat(r.rr)}</td>
+               <td class="num">${r.latency_ms}</td>
+             </tr>`
+          ).join('');
+          return `
+            <h3 style="margin-top: 16px; font-size: 13px">${pipe}</h3>
+            <table>
+              <tr><th>query</th><th>recall</th><th>prec</th><th>rr</th><th>ms</th></tr>
+              ${trs}
+            </table>`;
+        }).join('');
+        el.innerHTML = `<div><strong>Run #${runId} detail</strong></div>${sections}`;
+      } catch (e) { renderError(el, e); }
+    }
+
+    $('run-eval').onclick = async () => {
+      const s = $('eval-status');
+      s.textContent = 'starting…';
+      try {
+        const r = await adminFetch('/admin/eval/run', { method: 'POST' });
+        s.textContent = `started run #${r.run_id} (${r.n_queries} queries) — refreshing…`;
+        await loadEvalRuns();
+      } catch (e) { s.textContent = String(e.message || e); }
+    };
+
     $('refresh-metrics').onclick = loadMetrics;
     $('refresh-queries').onclick = loadQueries;
     $('refresh-stats').onclick = loadStats;
+    $('refresh-runs').onclick = loadEvalRuns;
 
     // Keep innerHTML-safe. Never trust server query strings; they're user-
     // provided and flow back through /admin/queries.
@@ -249,6 +364,7 @@
     if (getToken()) {
       loadMetrics();
       loadQueries();
+      loadEvalRuns();
     }
   </script>
 </body>

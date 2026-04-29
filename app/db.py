@@ -212,6 +212,50 @@ FULL OUTER JOIN impressions i ON i.result_id = e.result_id;
 -- Unique index is required for REFRESH ... CONCURRENTLY.
 CREATE UNIQUE INDEX IF NOT EXISTS result_ctr_result_id_idx
     ON result_ctr (result_id);
+
+
+-- ---------------------------------------------------------------------------
+-- eval_runs / eval_run_results: persisted history of retrieval-quality runs
+-- ---------------------------------------------------------------------------
+--
+-- Each row in eval_runs is one trigger of the offline eval — records which
+-- pipelines, which RankingConfig overrides, plus an aggregated summary
+-- (recall@10, precision@10, MRR, latency p95) once the run finishes.
+-- eval_run_results carries the per-(pipeline, query) breakdown for drill-in.
+--
+-- Persisted in Postgres (not /tmp / files) so deploys don't lose history,
+-- and the /admin dashboard can render comparable metrics over time.
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id           BIGSERIAL PRIMARY KEY,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at  TIMESTAMPTZ,
+    status       TEXT NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('running', 'done', 'error')),
+    pipelines    TEXT[] NOT NULL DEFAULT '{}',
+    n_queries    INT,
+    config       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- RankingConfig overrides
+    summary      JSONB NOT NULL DEFAULT '{}'::jsonb,  -- per-pipeline metrics
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS eval_runs_started_at_idx
+    ON eval_runs (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS eval_run_results (
+    id              BIGSERIAL PRIMARY KEY,
+    run_id          BIGINT NOT NULL REFERENCES eval_runs(id) ON DELETE CASCADE,
+    pipeline        TEXT NOT NULL,
+    query           TEXT NOT NULL,
+    n_relevant      INT NOT NULL,
+    precision_at_k  DOUBLE PRECISION NOT NULL,
+    recall_at_k     DOUBLE PRECISION NOT NULL,
+    rr              DOUBLE PRECISION NOT NULL,
+    latency_ms      INT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS eval_run_results_run_id_idx
+    ON eval_run_results (run_id);
 """
 
 

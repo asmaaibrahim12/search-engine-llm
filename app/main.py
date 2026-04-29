@@ -588,6 +588,134 @@ async def admin_top_queries(
     })
 
 
+# -----------------------------------------------------------------------------
+# Eval dashboard endpoints — same admin gate as the rest of /admin/*
+# -----------------------------------------------------------------------------
+#
+# Each /admin/eval/run kicks off a background task that runs the offline
+# eval against the labeled query set (eval/queries.json) and persists per-
+# pipeline + per-query metrics to eval_runs / eval_run_results. The dashboard
+# polls /admin/eval/runs to render history and drill-in.
+
+
+@app.post("/admin/eval/run")
+async def admin_eval_run(
+    request: Request,
+    background: BackgroundTasks,
+    pipelines: Optional[List[str]] = Query(default=None),
+) -> JSONResponse:
+    """Kick off a new eval run in the background. Returns immediately with
+    the new run_id; poll /admin/eval/runs for status."""
+    _require_admin(request)
+    from app import eval_runner
+    from app.search import DEFAULT_CONFIG
+
+    valid = {"vector", "vector_rerank", "hybrid", "hybrid_rerank"}
+    chosen = [p for p in (pipelines or list(valid)) if p in valid]
+    if not chosen:
+        raise HTTPException(400, "no valid pipelines selected")
+
+    queries = eval_runner.load_curated_queries()
+    pool = request.app.state.pool
+    run_id = await eval_runner.create_run(
+        pool, pipelines=chosen, config=DEFAULT_CONFIG, n_queries=len(queries),
+    )
+    background.add_task(
+        eval_runner.run_eval,
+        pool,
+        pipelines=chosen,
+        queries=queries,
+        config=DEFAULT_CONFIG,
+        run_id=run_id,
+    )
+    return JSONResponse({"run_id": run_id, "n_queries": len(queries),
+                         "pipelines": chosen, "status": "running"})
+
+
+@app.get("/admin/eval/runs")
+async def admin_eval_runs(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+) -> JSONResponse:
+    """List recent eval runs with their summary metrics (status, pipelines,
+    per-pipeline recall@10 / MRR / p95 latency)."""
+    _require_admin(request)
+    import json as _json
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, started_at, finished_at, status, pipelines,
+                   n_queries, summary, error
+            FROM eval_runs
+            ORDER BY started_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    out = []
+    for r in rows:
+        out.append({
+            "id":           int(r["id"]),
+            "started_at":   r["started_at"].isoformat(),
+            "finished_at":  r["finished_at"].isoformat() if r["finished_at"] else None,
+            "status":       r["status"],
+            "pipelines":    list(r["pipelines"] or []),
+            "n_queries":    r["n_queries"],
+            "summary":      _json.loads(r["summary"] or "{}"),
+            "error":        r["error"],
+        })
+    return JSONResponse({"runs": out})
+
+
+@app.get("/admin/eval/runs/{run_id}")
+async def admin_eval_run_detail(
+    request: Request, run_id: int,
+) -> JSONResponse:
+    """Per-(pipeline, query) breakdown for one run."""
+    _require_admin(request)
+    import json as _json
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        run = await conn.fetchrow(
+            "SELECT * FROM eval_runs WHERE id = $1", run_id,
+        )
+        if run is None:
+            raise HTTPException(404, "run not found")
+        rows = await conn.fetch(
+            """
+            SELECT pipeline, query, n_relevant, precision_at_k,
+                   recall_at_k, rr, latency_ms
+            FROM eval_run_results
+            WHERE run_id = $1
+            ORDER BY pipeline, query
+            """,
+            run_id,
+        )
+    return JSONResponse({
+        "id":           int(run["id"]),
+        "started_at":   run["started_at"].isoformat(),
+        "finished_at":  run["finished_at"].isoformat() if run["finished_at"] else None,
+        "status":       run["status"],
+        "pipelines":    list(run["pipelines"] or []),
+        "n_queries":    run["n_queries"],
+        "summary":      _json.loads(run["summary"] or "{}"),
+        "error":        run["error"],
+        "results": [
+            {
+                "pipeline":        r["pipeline"],
+                "query":           r["query"],
+                "n_relevant":      int(r["n_relevant"]),
+                "precision_at_k":  float(r["precision_at_k"]),
+                "recall_at_k":     float(r["recall_at_k"]),
+                "rr":              float(r["rr"]),
+                "latency_ms":      int(r["latency_ms"]),
+            }
+            for r in rows
+        ],
+    })
+
+
 @app.get("/admin/stats/{result_id}")
 async def admin_stats(request: Request, result_id: int) -> JSONResponse:
     """Inspect the CTR MV row for one result_id.
